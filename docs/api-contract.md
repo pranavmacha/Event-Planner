@@ -3,6 +3,8 @@
 All paths below are prefixed `/api`. JSON requests; cookie credentials; money is integer paise; dates ISO YYYY-MM-DD. IDs are opaque strings. Mutations return the full enriched Event unless noted. UI formats INR by dividing by 100. Errors return `{detail: string | validationErrors}`. Never store client-generated monetary totals.
 
 `GET /health` => `{status:"ok", ai_mode:"demo"|"live"}`
+
+Health and static responses do not set a session cookie. Event API responses establish it when needed. No-op edits return the current Event without adding a version or revision. An event changed/deleted while an AI preview is being generated returns 409/404 instead of persisting that preview.
 `GET /events` => Event[] (may be full objects)
 `POST /events` accepts EventInput => Event. `POST /events/sample` => Event (optional sample explicitly selected by user).
 `GET /events/{id}` => Event. `DELETE /events/{id}` => 204; deletes that event, its proposals and revision history. All operations enforce cookie ownership.
@@ -31,6 +33,8 @@ Proposal: `{id,base_version,status:"pending"|"applied"|"discarded",message,chang
 `DELETE /events/{id}/{collection}/{item_id}` accepts collection `budget`, `tasks` or `vendors`, plus optional `expected_version` query parameter, and returns Event. A task referenced by another task cannot be deleted until those dependencies are removed.
 
 Operational limits: 30 events per browser; 200 budget items, 200 tasks and 100 vendor options per event; 128 KiB maximum request body. AI endpoints share process-local rolling limits of 12 requests/browser/minute, 120/browser/hour and 30/source-IP/minute. Errors: 422 invalid input or planning constraint, 404 missing/unowned records, 409 version/state conflicts, 413 oversized requests, 429 rate limit and 503 AI/database unavailability. The anonymous cookie is HttpOnly and SameSite=Strict, with Secure controlled by COOKIE_SECURE.
+
+All event mutations share additional limits of 60 writes/browser/minute and 180/source-IP/minute. Rate-limit failures include `Retry-After`; a full limiter (10,000 active keys) returns 503 without evicting limits. Gemini concurrency is capped at four requests per event loop. Dependency explanations show the full issue count and at most three example task titles; readiness continues to check every dependency.
 
 AI internal interface (backend/app/ai.py):
 - `get_mode() -> str`

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   ArrowUpRight,
   ArrowRight,
@@ -631,20 +631,28 @@ export function TimelineView({
   busy: boolean;
 }) {
   const [filter, setFilter] = useState("all");
-  const tasks = [...event.tasks]
-    .filter(
-      (t) =>
-        filter === "all" ||
-        (filter === "done" && t.status === "done") ||
-        (filter === "ready" && t.readiness === "ready") ||
-        (filter === "attention" &&
-          ["blocked", "at_risk"].includes(t.readiness)),
-    )
-    .sort(
-      (a, b) =>
-        Number(a.status === "done") - Number(b.status === "done") ||
-        a.due_date.localeCompare(b.due_date),
-    );
+  const tasksById = useMemo(
+    () => new Map(event.tasks.map((task) => [task.id, task])),
+    [event.tasks],
+  );
+  const tasks = useMemo(
+    () =>
+      event.tasks
+      .filter(
+        (t) =>
+          filter === "all" ||
+          (filter === "done" && t.status === "done") ||
+          (filter === "ready" && t.readiness === "ready") ||
+          (filter === "attention" &&
+            ["blocked", "at_risk"].includes(t.readiness)),
+      )
+      .sort(
+        (a, b) =>
+          Number(a.status === "done") - Number(b.status === "done") ||
+          a.due_date.localeCompare(b.due_date),
+      ),
+    [event.tasks, filter],
+  );
   return (
     <div className="view-stack">
       <div className="view-intro">
@@ -727,7 +735,7 @@ export function TimelineView({
                 <div className="dependency-line">
                   <span>Depends on</span>
                   {t.dependencies.map((id) => {
-                    const prerequisite = event.tasks.find((p) => p.id === id);
+                    const prerequisite = tasksById.get(id);
                     return prerequisite ? (
                       <button
                         key={id}

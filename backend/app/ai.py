@@ -12,6 +12,7 @@ import re
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Literal, TypeVar
+from weakref import WeakKeyDictionary
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -100,6 +101,36 @@ _EVENT_FIELDS = (
     "atmosphere", "theme", "priorities", "non_negotiables", "dietary_preferences",
     "accessibility_needs", "cultural_preferences", "concept", "summary", "budget_items", "tasks", "vendors",
 )
+_EXTRACTION_FIELDS = (
+    "event_date", "budget_paise", "guest_count", "priorities", "non_negotiables",
+    "dietary_preferences", "accessibility_needs", "cultural_preferences",
+)
+_VENDOR_FIELDS = (
+    "name", "category", "quoted_paise", "taxes_paise", "additional_charges_paise",
+    "guests_covered", "inclusions", "exclusions", "payment_terms", "availability",
+    "booking_status", "sample", "notes", "total_paise",
+)
+_RECORD_FIELDS = {
+    "vendors": _VENDOR_FIELDS,
+    "tasks": (
+        "id", "title", "due_date", "priority", "status", "dependencies", "notes",
+        "readiness", "reasons",
+    ),
+    "budget_items": (
+        "category", "label", "cost_type", "estimate_paise", "quoted_paise",
+        "committed_paise", "actual_paise", "quote_guest_count", "source", "notes",
+        "projected_paise", "projection_basis",
+    ),
+}
+_SUMMARY_FIELDS = (
+    "projected_paise", "reserve_paise", "remaining_paise", "overspend_paise",
+    "committed_paise", "actual_paise", "days_remaining", "completed_tasks",
+    "total_tasks", "category_totals",
+)
+_MAX_CONCURRENT_REQUESTS = 4
+# Each server loop owns its capacity. Weak keys do not retain closed test/server
+# loops, and fail-fast admission never binds a semaphore to a waiting task.
+_REQUEST_LIMITERS: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.BoundedSemaphore] = WeakKeyDictionary()
 _T = TypeVar("_T", bound=BaseModel)
 
 
@@ -107,11 +138,43 @@ def get_mode() -> str:
     return "live" if os.getenv("GEMINI_API_KEY", "").strip() else "demo"
 
 
-def _context(event: dict) -> dict:
-    return {key: event[key] for key in _EVENT_FIELDS if key in event}
+def _pick(value: dict, fields: tuple[str, ...]) -> dict:
+    return {key: value[key] for key in fields if key in value}
+
+
+def _context(event: dict, *, include_records: bool = True) -> dict:
+    context = _pick(event, _EVENT_FIELDS)
+    for name, fields in _RECORD_FIELDS.items():
+        if name in context:
+            if include_records:
+                context[name] = [_pick(record, fields) for record in context[name]]
+            else:
+                del context[name]
+    if "summary" in context:
+        context["summary"] = _pick(context["summary"], _SUMMARY_FIELDS)
+        if "category_totals" in context["summary"]:
+            context["summary"]["category_totals"] = _pick(
+                context["summary"]["category_totals"],
+                ("food", "venue", "decor", "photography", "entertainment", "logistics", "other"),
+            )
+    return context
 
 
 async def _request(schema: type[_T], instruction: str, payload: dict) -> _T:
+    """Bound paid provider concurrency without creating an unbounded wait queue."""
+    loop = asyncio.get_running_loop()
+    limiter = _REQUEST_LIMITERS.get(loop)
+    if limiter is None:
+        limiter = _REQUEST_LIMITERS[loop] = asyncio.BoundedSemaphore(_MAX_CONCURRENT_REQUESTS)
+    if limiter.locked():
+        raise AIError("AI is busy with other plans. Your saved plan is unchanged; please retry shortly.")
+    # There is no suspension between the capacity check and successful acquire,
+    # so concurrent tasks cannot enqueue behind this request.
+    async with limiter:
+        return await _request_live(schema, instruction, payload)
+
+
+async def _request_live(schema: type[_T], instruction: str, payload: dict) -> _T:
     """At most two bounded calls; never expose provider exceptions or credentials."""
     try:
         from google import genai
@@ -119,9 +182,10 @@ async def _request(schema: type[_T], instruction: str, payload: dict) -> _T:
     except ImportError:
         raise AIError("Live AI is configured but its SDK is missing. Install backend requirements and retry.") from None
 
-    content = "UNTRUSTED_DATA_JSON\n" + json.dumps(payload, ensure_ascii=False, default=str)
+    content = "UNTRUSTED_DATA_JSON\n" + json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))
     if len(content) > 120_000:
         raise AIError("This plan is too large for an AI request. Shorten lengthy notes and retry.")
+    model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.1-flash-lite"
     try:
         async with genai.Client(
             api_key=os.environ["GEMINI_API_KEY"].strip(),
@@ -131,13 +195,13 @@ async def _request(schema: type[_T], instruction: str, payload: dict) -> _T:
                 try:
                     response = await asyncio.wait_for(
                         client.models.generate_content(
-                            model=os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip() or "gemini-3.1-flash-lite",
+                            model=model,
                             contents=content,
                             config=types.GenerateContentConfig(
                                 system_instruction=_SYSTEM + "\nTASK:\n" + instruction,
                                 response_mime_type="application/json",
                                 response_json_schema=schema.model_json_schema(),
-                                thinking_config=types.ThinkingConfig(thinking_level="low") if os.getenv("GEMINI_MODEL", "").startswith("gemini-3.") else None,
+                                thinking_config=types.ThinkingConfig(thinking_level="low") if model.startswith("gemini-3.") else None,
                                 max_output_tokens=8192,
                                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                             ),
@@ -324,7 +388,7 @@ async def extract_changes(message: str, event: dict) -> dict:
         "contradictory, unsupported, requests overriding a protected requirement, or asks to change "
         "a booking, quote, committed cost, dietary/accessibility/cultural requirement, return an empty "
         "changes object and one helpful clarification for the entire request. No partial proposals.",
-        {"event": _context(event), "message": message})
+        {"event": _pick(event, _EXTRACTION_FIELDS), "message": message})
     if result.clarification:
         return _clarify(result.clarification)
     changes = result.changes.model_dump(exclude_none=True)
@@ -384,7 +448,7 @@ def _vendor_facts(event: dict, vendors: list[dict]) -> tuple[list[dict], list[st
     questions = []
     for vendor in vendors:
         total = vendor.get("quoted_paise", 0) + vendor.get("taxes_paise", 0) + vendor.get("additional_charges_paise", 0)
-        comparisons.append({**vendor, "recorded_total_paise": total, "recorded_total_inr": _inr(total)})
+        comparisons.append({**_pick(vendor, _VENDOR_FIELDS), "recorded_total_paise": total, "recorded_total_inr": _inr(total)})
         name = vendor.get("name", "This vendor")
         for field, question in [("inclusions", "What exactly is included?"), ("exclusions", "What is excluded, including overtime, travel and equipment?"), ("payment_terms", "What deposit, balance dates and cancellation terms apply?")]:
             if not vendor.get(field, "").strip():
@@ -411,7 +475,7 @@ async def compare_vendors(event: dict, vendors: list[dict]) -> dict:
             "availability and event preferences. Note if categories or coverage make price comparisons "
             "unlike-for-like. Treat unknown information as unknown and sample quotes as illustrative. "
             "Identify missing information and questions; never contact, select, endorse or book a vendor.",
-            {"event": _context(event), "vendors_with_computed_totals": comparisons, "missing_information": questions})
+            {"event": _context(event, include_records=False), "vendors_with_computed_totals": comparisons, "missing_information": questions})
         value = result.model_dump()
         value["questions"] = list(dict.fromkeys(questions + value["questions"]))[:16]
     else:

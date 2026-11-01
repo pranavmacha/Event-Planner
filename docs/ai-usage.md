@@ -30,6 +30,8 @@ The frontend receives neither the key nor an SDK client. Do not put the key into
 
 Each request contains a fixed system instruction, a workflow-specific instruction, a Pydantic JSON Schema and an `UNTRUSTED_DATA_JSON` payload. The payload contains an allowlisted event context and, where relevant, the user's request, recorded vendor quotations or application-calculated revision impacts. Session cookies and ownership data are excluded.
 
+Change extraction includes only supported current fields and protected preferences. Vendor comparison sends selected quotations once and excludes unrelated task/budget/vendor records. Nested records and summary fields use explicit allowlists; JSON whitespace is compacted before transmission.
+
 The system instruction treats event descriptions, user messages and vendor text as untrusted data, requires preservation of non-negotiables and recorded expenses, prohibits invented prices/statuses and provides no execution or external action tools. Automatic function calling is explicitly disabled. Prompt instructions are defense in depth; schemas, calculation code and explicit proposal acceptance enforce the real boundary.
 
 The implementation uses the official `google-genai` Python SDK's asynchronous `client.models.generate_content` interface, `response_mime_type="application/json"`, and `response_json_schema=Schema.model_json_schema()`. Every response then passes `model_validate_json`. Schemas forbid extra fields and coercion, bound text/list sizes and amounts, validate calendar dates and restrict task priority values. Only guest count, budget, date and priorities are accepted in a proposed change. The backend validates these again before calculation and persistence.
@@ -52,13 +54,13 @@ Demo mode accepts INR amounts with commas or lakh/crore units, ISO dates, whole 
 
 ## Failures, retries and review
 
-Requests have a 25-second transport timeout and a 28-second coroutine bound. SDK retries are limited to one attempt; application code may retry once for malformed output, timeouts or transient server errors. Quota/auth/model errors are not blindly retried. Provider exception details are not returned to users or logged by this integration, avoiding accidental disclosure of request URLs or credentials.
+Requests have a 60-second transport timeout and a 65-second coroutine bound. SDK retries are limited to one attempt; application code may retry once for malformed output, timeouts or transient server errors. At most four live requests run concurrently per server event loop; excess requests fail promptly instead of accumulating in a queue. Quota/auth/model errors are not blindly retried. Provider exception details are not returned to users or logged by this integration, avoiding accidental disclosure of request URLs or credentials.
 
 Failures return a safe `AIError` for the backend to expose as HTTP 503. Existing work remains saved; the user can retry. Proposal request IDs and atomic version checks are enforced by the persistence layer, so a retry cannot apply a change twice. Text explanations are advice and can be mistaken; the before/after figures and explicit Apply/Discard controls remain the source of truth.
 
 ## Verification and sources
 
-`backend/tests/test_ai.py` covers old/new amount extraction, the exact flagship request, relative-date arithmetic across a leap-year boundary, conservative clarification, preference-based demo output, preserved inputs, quotation totals/omissions, strict output validation and mocked SDK success/failure behavior. Mock tests do not prove external API availability. No authenticated live Gemini request was completed during this implementation; enabling a real key and testing the selected model remains a deployment check.
+`backend/tests/test_ai.py` covers old/new amount extraction, the exact flagship request, relative-date arithmetic across a leap-year boundary, conservative clarification, preference-based demo output, preserved inputs, quotation totals/omissions, strict output validation, request admission/cancellation, minimized context and mocked SDK success/failure behavior. Mock tests do not prove external API availability. See `verification.md` for the earlier synthetic live connection and event-creation checks; the security and efficiency follow-up uses mocked AI without live requests.
 
 Official documentation consulted during development:
 

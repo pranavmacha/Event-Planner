@@ -164,6 +164,8 @@ def _mock_client(monkeypatch, outcomes):
         async def generate_content(self, **kwargs):
             calls.append(kwargs)
             outcome = outcomes.pop(0)
+            if callable(outcome):
+                outcome = await outcome()
             if isinstance(outcome, Exception):
                 raise outcome
             return SimpleNamespace(text=outcome)
@@ -216,3 +218,129 @@ def test_live_quota_failure_is_safe_and_not_retried(monkeypatch, event):
 def test_live_clarification_discards_any_partial_model_changes(monkeypatch, event):
     _mock_client(monkeypatch, [json.dumps({"changes": {"guest_count": 250}, "clarification": "Which city?"})])
     assert extract("250 guests and move city", event) == {"changes": {}, "clarification": "Which city?"}
+
+
+def _payload(call):
+    return json.loads(call["contents"].split("\n", 1)[1])
+
+
+def test_live_extraction_accepts_large_plan_without_sending_unrelated_records(monkeypatch, event):
+    response = json.dumps({"changes": {"guest_count": 250}, "clarification": None})
+    calls, _ = _mock_client(monkeypatch, [response])
+    event.update(
+        tasks=[{"title": "Unrelated task", "notes": "x" * 4000} for _ in range(40)],
+        vendors=[{"name": "Unrelated vendor", "notes": "sensitive-vendor-notes"}],
+        budget_items=[{"notes": "sensitive-budget-notes"}],
+    )
+    before = copy.deepcopy(event)
+    assert extract("250 guests", event)["changes"] == {"guest_count": 250}
+    sent = _payload(calls[0])["event"]
+    assert sent["event_date"] == event["event_date"]
+    assert sent["non_negotiables"] == event["non_negotiables"]
+    assert sent["accessibility_needs"] == event["accessibility_needs"]
+    assert "tasks" not in sent and "vendors" not in sent and "budget_items" not in sent
+    assert len(calls[0]["contents"]) < 2000
+    assert event == before
+
+
+def test_live_comparison_sends_selected_vendors_once_and_filters_metadata(monkeypatch, event):
+    calls, _ = _mock_client(monkeypatch, [json.dumps({"summary": "Compare the scope.", "tradeoffs": [], "questions": []})])
+    vendors = [
+        {"name": "Selected A", "category": "food", "quoted_paise": 1000, "private_metadata": "private-secret"},
+        {"name": "Selected B", "category": "food", "quoted_paise": 2000},
+    ]
+    event["vendors"] = [*vendors, {"name": "Unselected", "notes": "unselected-sensitive-notes"}]
+    before = copy.deepcopy(event)
+    asyncio.run(ai.compare_vendors(event, vendors))
+    payload = _payload(calls[0])
+    assert "vendors" not in payload["event"]
+    assert payload["event"]["non_negotiables"] == event["non_negotiables"]
+    assert [v["name"] for v in payload["vendors_with_computed_totals"]] == ["Selected A", "Selected B"]
+    assert payload["vendors_with_computed_totals"][0]["recorded_total_paise"] == 1000
+    assert "private-secret" not in calls[0]["contents"]
+    assert "unselected-sensitive-notes" not in calls[0]["contents"]
+    assert event == before
+
+
+def test_live_revision_retains_planning_facts_and_filters_record_metadata(monkeypatch, event):
+    calls, _ = _mock_client(monkeypatch, [json.dumps({"tradeoffs": [], "warnings": [], "assumptions": []})])
+    event["tasks"] = [{"id": "task-1", "title": "Confirm venue", "dependencies": ["task-0"],
+                       "readiness": "blocked", "private_metadata": "private-task-secret"}]
+    event["vendors"] = [{"name": "Recorded venue", "booking_status": "booked", "private_metadata": "private-vendor-secret"}]
+    event["budget_items"] = [{"label": "Venue", "committed_paise": 12345, "private_metadata": "private-budget-secret"}]
+    event["summary"]["private_metadata"] = "private-summary-secret"
+    after = {**event, "guest_count": 250}
+    asyncio.run(ai.explain_revision(event, after, {}))
+    payload = _payload(calls[0])
+    assert payload["before"]["tasks"][0]["dependencies"] == ["task-0"]
+    assert payload["after"]["vendors"][0]["booking_status"] == "booked"
+    assert payload["after"]["budget_items"][0]["committed_paise"] == 12345
+    assert "private_metadata" not in calls[0]["contents"]
+
+
+@pytest.mark.parametrize("model", [None, "   ", " gemini-3.1-flash-lite "])
+def test_default_and_trimmed_model_keep_low_thinking(monkeypatch, event, model):
+    calls, _ = _mock_client(monkeypatch, [json.dumps({"changes": {"guest_count": 250}, "clarification": None})])
+    if model is None:
+        monkeypatch.delenv("GEMINI_MODEL")
+    else:
+        monkeypatch.setenv("GEMINI_MODEL", model)
+    extract("250 guests", event)
+    assert calls[0]["model"] == "gemini-3.1-flash-lite"
+    assert calls[0]["config"].thinking_config.thinking_level.value == "LOW"
+
+
+def test_live_concurrency_rejects_overload_and_releases_cancelled_slots(monkeypatch, event):
+    monkeypatch.setattr(ai, "_MAX_CONCURRENT_REQUESTS", 2)
+
+    async def exercise():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        entered = 0
+
+        async def blocked_response():
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                started.set()
+            await release.wait()
+            return json.dumps({"changes": {"guest_count": 250}, "clarification": None})
+
+        calls, clients = _mock_client(monkeypatch, [blocked_response] * 3)
+        requests = [asyncio.create_task(ai.extract_changes("250 guests", event)) for _ in range(2)]
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            with pytest.raises(ai.AIError, match="busy"):
+                await asyncio.wait_for(ai.extract_changes("250 guests", event), timeout=1)
+            assert len(calls) == 2 and len(clients) == 2
+            requests[0].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await requests[0]
+            assert clients[0].closed
+            requests.append(asyncio.create_task(ai.extract_changes("250 guests", event)))
+            release.set()
+            results = await asyncio.wait_for(asyncio.gather(*requests[1:]), timeout=1)
+            assert all(result["changes"] == {"guest_count": 250} for result in results)
+            assert len(calls) == 3 and all(client.closed for client in clients)
+        finally:
+            release.set()
+            for request in requests:
+                if not request.done():
+                    request.cancel()
+            await asyncio.gather(*requests, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+def test_live_provider_failure_releases_capacity(monkeypatch, event):
+    monkeypatch.setattr(ai, "_MAX_CONCURRENT_REQUESTS", 1)
+    response = json.dumps({"changes": {"guest_count": 250}, "clarification": None})
+    calls, clients = _mock_client(monkeypatch, [RuntimeError("provider-secret"), response])
+
+    async def exercise():
+        with pytest.raises(ai.AIError, match="temporarily unavailable"):
+            await ai.extract_changes("250 guests", event)
+        assert (await ai.extract_changes("250 guests", event))["changes"] == {"guest_count": 250}
+
+    asyncio.run(exercise())
+    assert len(calls) == 2 and all(client.closed for client in clients)

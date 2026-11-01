@@ -9,6 +9,7 @@ from datetime import datetime
 
 CATEGORIES = ['food', 'venue', 'decor', 'photography', 'entertainment', 'logistics', 'other']
 MAX_SAFE_INTEGER = 2**53 - 1
+DEPENDENCY_REASON_EXAMPLES = 3
 
 
 class PlanningValidationError(ValueError):
@@ -83,30 +84,38 @@ def validate_dependencies(tasks: list[dict]) -> None:
 
 def enrich_tasks(tasks: list[dict], event_date: str, as_of: date) -> list[dict]:
     by_id = {task['id']: task for task in tasks}
+    event_day = date.fromisoformat(event_date)
+    due_dates = {task['id']: date.fromisoformat(task['due_date'])
+                 for task in tasks if task['status'] != 'done'}
     result = deepcopy(tasks)
     for task in result:
         reasons = []
         if task['status'] == 'done':
             task.update(readiness='done', reasons=['Completed.'])
             continue
-        due = date.fromisoformat(task['due_date'])
+        due = due_dates[task['id']]
         waiting = [by_id[dep] for dep in task['dependencies'] if by_id[dep]['status'] != 'done']
         risk = False
         if due < as_of:
             reasons.append('Deadline has passed; agree a new feasible date.')
             risk = True
-        if due > date.fromisoformat(event_date):
+        if due > event_day:
             reasons.append('Deadline falls after the event; reschedule before the celebration.')
             risk = True
-        for predecessor in waiting:
-            reasons.append(f"Waiting for: {predecessor['title']}.")
-            predecessor_due = date.fromisoformat(predecessor['due_date'])
-            if predecessor_due < as_of:
-                reasons.append(f"Prerequisite is overdue: {predecessor['title']}.")
-                risk = True
-            if predecessor_due > due:
-                reasons.append(f"Prerequisite is scheduled after this task: {predecessor['title']}.")
-                risk = True
+        # Evaluate every prerequisite, but bound repeated title text in the
+        # response and stored snapshots. Each issue keeps its full count.
+        overdue = [predecessor for predecessor in waiting if due_dates[predecessor['id']] < as_of]
+        scheduled_later = [predecessor for predecessor in waiting if due_dates[predecessor['id']] > due]
+        risk = risk or bool(overdue) or bool(scheduled_later)
+        for label, predecessors in [('Waiting for prerequisites', waiting),
+                                    ('Prerequisites overdue', overdue),
+                                    ('Prerequisites scheduled after this task', scheduled_later)]:
+            if not predecessors:
+                continue
+            examples = '; '.join(predecessor['title'] for predecessor in predecessors[:DEPENDENCY_REASON_EXAMPLES])
+            remaining = len(predecessors) - DEPENDENCY_REASON_EXAMPLES
+            suffix = f'; and {remaining} more' if remaining > 0 else ''
+            reasons.append(f'{label} ({len(predecessors)}): {examples}{suffix}.')
         task['readiness'] = 'at_risk' if risk else 'blocked' if waiting else 'ready'
         task['reasons'] = reasons or ['All prerequisites are complete; this task is ready to start.']
     return result

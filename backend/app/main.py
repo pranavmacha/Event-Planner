@@ -5,8 +5,6 @@ import hashlib
 import os
 import re
 import secrets
-import time
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import date, timezone
@@ -27,37 +25,13 @@ load_dotenv(Path(__file__).resolve().parents[2] / '.env')
 from . import ai
 from .database import Database, EventRecord, ProposalRecord, RevisionRecord
 from .planning import PlanningValidationError, baseline_plan, enrich_event, new_id, revise_plan, today, validate_dependencies
+from .security import RateLimiter
 from .schemas import (BudgetInput, BudgetPatch, Changes, CompareInput, EventInput,
                       ProposalInput, RestoreInput, TaskInput, TaskPatch, VendorInput, VendorPatch)
 
 COOKIE_NAME = 'gatherly_session'
 MAX_BODY_BYTES = 128 * 1024
 DEFAULT_ORIGINS = 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000'
-
-
-class RateLimiter:
-    """Bounded process-local rolling windows; deploy one worker or use a shared limiter."""
-    def __init__(self):
-        self.windows = defaultdict(deque)
-
-    def check(self, request: Request):
-        if os.getenv('DISABLE_RATE_LIMIT', '').lower() == 'true':
-            return
-        now = time.monotonic()
-        owner = request.state.owner_hash
-        ip = request.client.host if request.client else 'unknown'
-        for key, limit, period in [(f'ip:{ip}', 30, 60), (f'owner:{owner}', 12, 60), (f'hour:{owner}', 120, 3600)]:
-            window = self.windows[key]
-            while window and now - window[0] >= period:
-                window.popleft()
-            if len(window) >= limit:
-                raise HTTPException(429, 'Too many AI requests. Please wait a minute and retry.', headers={'Retry-After': '60'})
-        for key in [f'owner:{owner}', f'ip:{ip}', f'hour:{owner}']:
-            self.windows[key].append(now)
-        if len(self.windows) > 10000:
-            for key in list(self.windows):
-                if not self.windows[key] or now - self.windows[key][-1] > 3600:
-                    del self.windows[key]
 
 
 def create_app(database_url: str | None = None) -> FastAPI:
@@ -92,6 +66,8 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 declared_size = int(request.headers.get('content-length', 0))
             except ValueError:
                 return JSONResponse({'detail': 'Invalid request size.'}, status_code=400)
+            if declared_size < 0:
+                return JSONResponse({'detail': 'Invalid request size.'}, status_code=400)
             if declared_size > MAX_BODY_BYTES:
                 return JSONResponse({'detail': 'Request is too large (maximum 128 KiB).'}, status_code=413)
             if request.method not in ['GET', 'HEAD', 'OPTIONS']:
@@ -103,18 +79,37 @@ def create_app(database_url: str | None = None) -> FastAPI:
                         return JSONResponse({'detail': 'Request is too large (maximum 128 KiB).'}, status_code=413)
                     chunks.append(chunk)
                 request._body = b''.join(chunks)
-        token = request.cookies.get(COOKIE_NAME, '')
-        is_new = not re.fullmatch(r'[A-Za-z0-9_-]{43}', token)
-        if is_new:
-            token = secrets.token_urlsafe(32)
-        request.state.owner_hash = hashlib.sha256(token.encode()).hexdigest()
+        # Health probes and static resources must not replace an event session
+        # when the browser's first requests run concurrently.
+        needs_session = request.url.path == '/api/events' or request.url.path.startswith('/api/events/')
+        is_new = False
+        if needs_session:
+            token = request.cookies.get(COOKIE_NAME, '')
+            is_new = not re.fullmatch(r'[A-Za-z0-9_-]{43}', token)
+            if is_new:
+                token = secrets.token_urlsafe(32)
+            request.state.owner_hash = hashlib.sha256(token.encode()).hexdigest()
+            if request.method not in ['GET', 'HEAD', 'OPTIONS']:
+                try:
+                    limiter.check_write(request)
+                except HTTPException as exc:
+                    return JSONResponse({'detail': exc.detail}, status_code=exc.status_code, headers=exc.headers)
         response = await call_next(request)
         if is_new:
             response.set_cookie(COOKIE_NAME, token, max_age=365 * 24 * 60 * 60,
                                 httponly=True, secure=os.getenv('COOKIE_SECURE', 'false').lower() == 'true',
                                 samesite='strict', path='/')
+        return response
+
+    @app.middleware('http')
+    async def response_security(request: Request, call_next):
+        response = await call_next(request)
         response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
         response.headers['Referrer-Policy'] = 'same-origin'
+        response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+        if os.getenv('COOKIE_SECURE', 'false').lower() == 'true':
+            response.headers['Strict-Transport-Security'] = 'max-age=31536000'
         if request.url.path.startswith('/api'):
             response.headers['Cache-Control'] = 'no-store'
         return response
@@ -146,6 +141,17 @@ def create_app(database_url: str | None = None) -> FastAPI:
             raise HTTPException(404, 'Event not found.')
         return record
 
+    def lock_owned_event(event_id: str, request: Request, db: Session) -> EventRecord:
+        # A no-op UPDATE serializes deletion and proposal insertion on both
+        # SQLite and Postgres, including existing databases without FK cascades.
+        locked = db.execute(update(EventRecord).where(EventRecord.id == event_id,
+                            EventRecord.owner_hash == request.state.owner_hash)
+                            .values(version=EventRecord.version), execution_options={'synchronize_session': False})
+        if locked.rowcount != 1:
+            raise HTTPException(404, 'Event not found.')
+        db.expire_all()
+        return owned_event(event_id, request, db)
+
     def current_event(record: EventRecord):
         return enrich_event(record.data, record.version)
 
@@ -157,6 +163,8 @@ def create_app(database_url: str | None = None) -> FastAPI:
         expected = record.version if expected_version is None else expected_version
         if expected != record.version:
             raise HTTPException(409, 'This plan has changed. Refresh it before saving your edit.')
+        if data == record.data:
+            return current_event(record)
         new_data = enrich_event(data, record.version + 1)
         revision(db, record, label)
         updated = db.execute(update(EventRecord).where(EventRecord.id == record.id,
@@ -191,9 +199,13 @@ def create_app(database_url: str | None = None) -> FastAPI:
         count = db.scalar(select(func.count()).select_from(EventRecord).where(EventRecord.owner_hash == request.state.owner_hash))
         if count >= 30:
             raise HTTPException(422, 'This browser has reached the 30-event limit. Remove an older event first.')
+        db.close()  # Release the pooled connection before waiting on Gemini.
         base = payload.model_dump(mode='json')
         generated = await ai.generate_plan(base)
         event = baseline_plan(base, generated, ai.get_mode())
+        count = db.scalar(select(func.count()).select_from(EventRecord).where(EventRecord.owner_hash == request.state.owner_hash))
+        if count >= 30:
+            raise HTTPException(422, 'This browser has reached the 30-event limit. Remove an older event first.')
         record = EventRecord(id=event['id'], owner_hash=request.state.owner_hash, version=1, data=event)
         db.add(record)
         revision(db, record, 'Original generated plan')
@@ -236,7 +248,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
     @app.delete('/api/events/{event_id}', status_code=204)
     def delete_event(event_id: str, request: Request, db: Session = Depends(get_db)):
-        owned_event(event_id, request, db)
+        lock_owned_event(event_id, request, db)
         db.execute(delete(ProposalRecord).where(ProposalRecord.event_id == event_id))
         db.execute(delete(RevisionRecord).where(RevisionRecord.event_id == event_id))
         db.execute(delete(EventRecord).where(EventRecord.id == event_id, EventRecord.owner_hash == request.state.owner_hash))
@@ -342,7 +354,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
             raise HTTPException(422, 'Choose at least two different vendor options.')
         vendors = [matching_item(record.data, 'vendors', item_id) for item_id in payload.vendor_ids]
         limiter.check(request)
-        return await ai.compare_vendors(current_event(record), vendors)
+        snapshot = current_event(record)
+        db.close()
+        return await ai.compare_vendors(snapshot, vendors)
 
     def proposal_response(record: ProposalRecord):
         return {**record.data, 'id': record.id, 'base_version': record.base_version, 'status': record.status, 'message': record.message}
@@ -363,6 +377,8 @@ def create_app(database_url: str | None = None) -> FastAPI:
             return proposal_response(existing)
         limiter.check(request)
         before = current_event(record)
+        base_version = record.version
+        db.close()
         extracted = await ai.extract_changes(payload.message, before)
         if extracted.get('clarification'):
             return {'clarification': extracted['clarification'], 'ai_mode': ai.get_mode()}
@@ -383,8 +399,12 @@ def create_app(database_url: str | None = None) -> FastAPI:
                     warnings=list(dict.fromkeys(impacts['warnings'] + explanation.get('warnings', []))),
                     assumptions=['Recorded quotes, commitments, spending, bookings and non-negotiables are preserved. Only the explicit proposed fields and unfinished task deadlines change.'] + explanation.get('assumptions', []),
                     ai_mode=ai.get_mode())
+        # A plan can be changed or deleted while the model is responding.
+        record = lock_owned_event(event_id, request, db)
+        if record.version != base_version:
+            raise HTTPException(409, 'This plan changed while the preview was generated. Please try again.')
         proposal = ProposalRecord(id=new_id(), event_id=event_id, request_id=payload.request_id,
-                                  base_version=record.version, status='pending', message=payload.message, data=data)
+                                  base_version=base_version, status='pending', message=payload.message, data=data)
         db.add(proposal)
         try:
             db.commit()
@@ -431,8 +451,13 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
     @app.get('/api/events/{event_id}/revisions')
     def revisions(event_id: str, request: Request, db: Session = Depends(get_db)):
-        owned_event(event_id, request, db)
-        records = db.scalars(select(RevisionRecord).where(RevisionRecord.event_id == event_id).order_by(RevisionRecord.created_at.desc())).all()
+        if db.scalar(select(EventRecord.id).where(EventRecord.id == event_id,
+                      EventRecord.owner_hash == request.state.owner_hash)) is None:
+            raise HTTPException(404, 'Event not found.')
+        records = db.execute(select(RevisionRecord.id, RevisionRecord.created_at, RevisionRecord.label,
+                                    RevisionRecord.version, RevisionRecord.restored)
+                             .where(RevisionRecord.event_id == event_id)
+                             .order_by(RevisionRecord.created_at.desc())).all()
         return [dict(id=item.id, created_at=(item.created_at if item.created_at.tzinfo is not None else item.created_at.replace(tzinfo=timezone.utc)).isoformat(), label=item.label, version=item.version, restored=bool(item.restored)) for item in records]
 
     @app.post('/api/events/{event_id}/revisions/{revision_id}/restore')
@@ -454,13 +479,26 @@ def create_app(database_url: str | None = None) -> FastAPI:
     def frontend(path: str):
         if path == 'api' or path.startswith('api/'):
             raise HTTPException(404, 'API route not found.')
+        if any(part.startswith('.') for part in Path(path).parts):
+            raise HTTPException(404, 'File not found.')
         candidate = (static_dir / path).resolve()
         if candidate.is_relative_to(static_dir) and candidate.is_file():
-            return FileResponse(candidate)
+            cache = 'public, max-age=31536000, immutable' if path.startswith('assets/') and re.search(r'-[\w-]{8,}\.', candidate.name) else 'no-cache'
+            if candidate.suffix == '.html':
+                return frontend_html(candidate)
+            return FileResponse(candidate, headers={'Cache-Control': cache})
+        if path.startswith('assets/'):
+            raise HTTPException(404, 'Asset not found.')
         index = static_dir / 'index.html'
         if index.is_file():
-            return FileResponse(index)
+            return frontend_html(index)
         raise HTTPException(404, 'Frontend build not found. Run the Vite frontend or build it first.')
+
+    def frontend_html(path: Path):
+        return FileResponse(path, headers={
+            'Cache-Control': 'no-cache',
+            'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        })
 
     return app
 

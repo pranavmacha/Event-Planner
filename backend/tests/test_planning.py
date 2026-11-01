@@ -1,5 +1,6 @@
 from copy import deepcopy
 from datetime import date
+import json
 
 import pytest
 
@@ -87,6 +88,40 @@ def test_dependency_completion_and_overdue_predecessors():
 def test_impossible_dependency_dates_are_flagged():
     tasks = [task('venue', due_date='2027-06-20'), task('invites', ['venue'], due_date='2027-06-10')]
     assert enrich_tasks(tasks, '2027-07-01', date(2027, 6, 1))[1]['readiness'] == 'at_risk'
+
+
+def test_dependency_reasons_are_bounded_for_large_valid_plans():
+    tasks = [task(str(index), [str(dependency) for dependency in range(max(0, index - 50), index)],
+                  title=f'{index:03d}' + 'x' * 237, notes='x' * 4000, due_date='2027-05-01')
+             for index in range(200)]
+    original = deepcopy(tasks)
+    result = enrich_tasks(tasks, '2027-07-01', date(2027, 6, 1))
+    last = result[-1]
+    assert last['dependencies'] == original[-1]['dependencies']
+    assert last['readiness'] == 'at_risk'
+    assert any('Waiting for prerequisites (50)' in reason and 'and 47 more' in reason
+               for reason in last['reasons'])
+    assert any('Prerequisites overdue (50)' in reason for reason in last['reasons'])
+    # The dependency explanation previously amplified this allowed input to
+    # over five megabytes; the summary must remain close to the source size.
+    assert len(json.dumps(result)) < len(json.dumps(original)) * 1.5
+    assert tasks == original
+
+
+def test_undisplayed_prerequisites_still_contribute_all_readiness_risks():
+    prerequisites = [task(f'ready-{index}') for index in range(8)]
+    prerequisites += [task('late-overdue', due_date='2027-05-01'),
+                      task('late-sequence', due_date='2027-06-30'),
+                      task('completed-overdue', due_date='2027-05-01', status='done')]
+    tasks = prerequisites + [task('dependent', [row['id'] for row in prerequisites], due_date='2027-06-20')]
+    result = enrich_tasks(tasks, '2027-07-01', date(2027, 6, 1))[-1]
+    assert result['readiness'] == 'at_risk'
+    assert len(result['dependencies']) == 11
+    assert any('Waiting for prerequisites (10)' in reason and 'and 7 more' in reason
+               for reason in result['reasons'])
+    assert any('Prerequisites overdue (1): late-overdue' in reason for reason in result['reasons'])
+    assert any('scheduled after this task (1): late-sequence' in reason for reason in result['reasons'])
+    assert all('completed-overdue' not in reason for reason in result['reasons'])
 
 
 def test_summary_reserve_remaining_and_overspend():

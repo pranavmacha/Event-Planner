@@ -24,7 +24,7 @@ export default defineConfig({
       command: process.env.GATHERLY_BACKEND_COMMAND || '../backend/.venv/bin/uvicorn app.main:app --app-dir ../backend --host 127.0.0.1 --port 8000',
       url: 'http://127.0.0.1:8000/api/health',
       reuseExistingServer: !process.env.CI,
-      env: {DATABASE_URL: 'sqlite:///./test-results/e2e.db', GEMINI_API_KEY: '', ALLOWED_ORIGINS: 'http://127.0.0.1:5173,http://localhost:5173'},
+      env: {DATABASE_URL: 'sqlite:///./test-results/e2e.db', GEMINI_API_KEY: '', ALLOWED_ORIGINS: 'http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:8000'},
       timeout: 60_000,
     },
   ],

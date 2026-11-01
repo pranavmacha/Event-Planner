@@ -58,6 +58,20 @@ const navigation = [
   { id: "vendors" as View, label: "Vendors", icon: Store },
   { id: "history" as View, label: "Plan history", icon: History },
 ];
+function rememberEvent(id: string) {
+  try {
+    localStorage.setItem("gatherly.activeEvent", id);
+  } catch {
+    // Browser storage is optional; a successful server save must remain successful.
+  }
+}
+function rememberedEvent() {
+  try {
+    return localStorage.getItem("gatherly.activeEvent");
+  } catch {
+    return null;
+  }
+}
 export default function App() {
   const [events, setEvents] = useState<PlanningEvent[]>([]);
   const [activeId, setActiveId] = useState("");
@@ -83,6 +97,8 @@ export default function App() {
   const [revisions, setRevisions] = useState<Revision[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [restore, setRestore] = useState<Revision | null>(null);
+  const operationPending = useRef(false);
+  const workspaceRequest = useRef<AbortController | null>(null);
   const pendingRequest = useRef<{
     eventId: string;
     message: string;
@@ -93,41 +109,59 @@ export default function App() {
   const modalIsOpen = Boolean(
     wizard || editor || assistantOpen || proposalOpen || comparison || restore,
   );
-  const adopt = useCallback((updated: PlanningEvent) => {
-    setEvents((list) =>
-      list.some((e) => e.id === updated.id)
+  const adopt = useCallback((updated: PlanningEvent, select = true) => {
+    setEvents((list) => {
+      const existing = list.find((e) => e.id === updated.id);
+      // A read started before a save may finish after it. Never roll the UI back.
+      if (existing && existing.version > updated.version) return list;
+      return existing
         ? list.map((e) => (e.id === updated.id ? updated : e))
-        : [updated, ...list],
-    );
-    setActiveId(updated.id);
-    localStorage.setItem("gatherly.activeEvent", updated.id);
+        : [updated, ...list];
+    });
+    if (select) {
+      setActiveId(updated.id);
+      rememberEvent(updated.id);
+    }
   }, []);
   const load = useCallback(async () => {
+    workspaceRequest.current?.abort();
+    const controller = new AbortController();
+    workspaceRequest.current = controller;
     setLoading(true);
     setLoadError("");
     try {
       const [list, health] = await Promise.all([
-        api<PlanningEvent[]>("/events"),
-        api<{ ai_mode: string }>("/health"),
+        api<PlanningEvent[]>("/events", "GET", undefined, {
+          signal: controller.signal,
+        }),
+        api<{ ai_mode: string }>("/health", "GET", undefined, {
+          signal: controller.signal,
+        }),
       ]);
+      if (controller.signal.aborted) return;
       setEvents(list);
       setMode(health.ai_mode);
-      const saved = localStorage.getItem("gatherly.activeEvent");
+      const saved = rememberedEvent();
       setActiveId(
         list.some((e) => e.id === saved) ? saved! : list[0]?.id || "",
       );
     } catch (error) {
+      if (controller.signal.aborted) return;
       setLoadError(
         error instanceof Error
           ? error.message
           : "Could not load your workspace.",
       );
     } finally {
-      setLoading(false);
+      if (workspaceRequest.current === controller) {
+        workspaceRequest.current = null;
+        if (!controller.signal.aborted) setLoading(false);
+      }
     }
   }, []);
   useEffect(() => {
     void load();
+    return () => workspaceRequest.current?.abort();
   }, [load]);
   useEffect(() => {
     if (!toast || toast.error) return;
@@ -136,32 +170,65 @@ export default function App() {
   }, [toast]);
   useEffect(() => {
     if (!event || view !== "history") return;
-    let alive = true;
+    const controller = new AbortController();
     setHistoryLoading(true);
-    api<Revision[]>(`/events/${event.id}/revisions`)
+    api<Revision[]>(`/events/${event.id}/revisions`, "GET", undefined, {
+      signal: controller.signal,
+    })
       .then((r) => {
-        if (alive) setRevisions(r);
+        if (!controller.signal.aborted) setRevisions(r);
       })
       .catch((e) => {
-        if (alive) setToast({ text: e.message, error: true });
+        if (!controller.signal.aborted)
+          setToast({ text: e.message, error: true });
       })
       .finally(() => {
-        if (alive) setHistoryLoading(false);
+        if (!controller.signal.aborted) setHistoryLoading(false);
       });
-    return () => {
-      alive = false;
-    };
+    return () => controller.abort();
   }, [event?.id, event?.version, view]);
   useEffect(() => {
+    let controller: AbortController | null = null;
+    let lastRefresh = 0;
     const refresh = () => {
-      if (activeId)
-        void api<PlanningEvent>(`/events/${activeId}`)
-          .then(adopt)
-          .catch(() => {});
+      if (
+        !activeId ||
+        operationPending.current ||
+        controller ||
+        Date.now() - lastRefresh < 5000
+      )
+        return;
+      lastRefresh = Date.now();
+      const request = new AbortController();
+      controller = request;
+      void api<PlanningEvent>(`/events/${activeId}`, "GET", undefined, {
+        signal: request.signal,
+      })
+        .then((updated) => {
+          if (!request.signal.aborted) adopt(updated, false);
+        })
+        .catch(() => {})
+        .finally(() => {
+          controller = null;
+        });
     };
     window.addEventListener("focus", refresh);
-    return () => window.removeEventListener("focus", refresh);
+    return () => {
+      controller?.abort();
+      window.removeEventListener("focus", refresh);
+    };
   }, [activeId, adopt]);
+  const beginOperation = (label: string) => {
+    // A ref locks immediately, including two submissions before React re-renders.
+    if (operationPending.current) return false;
+    operationPending.current = true;
+    setBusy(label);
+    return true;
+  };
+  const endOperation = () => {
+    operationPending.current = false;
+    setBusy("");
+  };
   const report = (error: unknown) => {
     setToast({
       text:
@@ -172,7 +239,7 @@ export default function App() {
     });
     if (error instanceof ApiError && error.status === 409 && event)
       void api<PlanningEvent>(`/events/${event.id}`)
-        .then(adopt)
+        .then((updated) => adopt(updated, false))
         .catch(() => {});
   };
   const save = async (
@@ -181,7 +248,7 @@ export default function App() {
     data: unknown,
     success: string,
   ) => {
-    setBusy("saving");
+    if (!beginOperation("saving")) return false;
     try {
       const updated = await api<PlanningEvent>(path, method, data);
       adopt(updated);
@@ -191,7 +258,7 @@ export default function App() {
       report(error);
       return false;
     } finally {
-      setBusy("");
+      endOperation();
     }
   };
   const create = async (data: EventInput) => {
@@ -209,7 +276,7 @@ export default function App() {
     return ok;
   };
   const sample = async () => {
-    setBusy("sample");
+    if (!beginOperation("sample")) return;
     try {
       const created = await api<PlanningEvent>("/events/sample", "POST", {});
       adopt(created);
@@ -220,7 +287,7 @@ export default function App() {
     } catch (error) {
       report(error);
     } finally {
-      setBusy("");
+      endOperation();
     }
   };
   const toggleTask = async (task: Task) => {
@@ -238,8 +305,7 @@ export default function App() {
     );
   };
   const preview = async (message: string) => {
-    if (!event) return false;
-    setBusy("proposal");
+    if (!event || !beginOperation("proposal")) return false;
     setClarification("");
     if (
       pendingRequest.current?.message !== message ||
@@ -270,7 +336,7 @@ export default function App() {
       report(error);
       return false;
     } finally {
-      setBusy("");
+      endOperation();
     }
   };
   const apply = async () => {
@@ -288,8 +354,7 @@ export default function App() {
     }
   };
   const discard = async () => {
-    if (!event || !proposal) return;
-    setBusy("discard");
+    if (!event || !proposal || !beginOperation("discard")) return;
     try {
       await api(
         `/events/${event.id}/proposals/${proposal.id}/discard`,
@@ -304,12 +369,11 @@ export default function App() {
     } catch (error) {
       report(error);
     } finally {
-      setBusy("");
+      endOperation();
     }
   };
   const compare = async (ids: string[]) => {
-    if (!event) return;
-    setBusy("compare");
+    if (!event || !beginOperation("compare")) return;
     try {
       const result = await api<Comparison>(
         `/events/${event.id}/vendors/compare`,
@@ -320,7 +384,7 @@ export default function App() {
     } catch (error) {
       report(error);
     } finally {
-      setBusy("");
+      endOperation();
     }
   };
   const restoreVersion = async () => {
@@ -334,14 +398,18 @@ export default function App() {
     if (ok) setRestore(null);
   };
   const switchEvent = (id: string) => {
+    if (operationPending.current) return;
     setActiveId(id);
-    localStorage.setItem("gatherly.activeEvent", id);
+    rememberEvent(id);
     setView("overview");
     setProposal(null);
     setProposalOpen(false);
     setClarification("");
     setMobileNav(false);
     setComparison(null);
+    setEditor(null);
+    setRestore(null);
+    setAssistantOpen(false);
   };
   const navigate = (v: View) => {
     setView(v);

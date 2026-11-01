@@ -294,3 +294,130 @@ def test_revision_timestamps_include_utc_offset_for_local_display(client, app, e
     assert timestamp == '2026-11-01T18:45:00+00:00'
     local = datetime.fromisoformat(timestamp).astimezone(ZoneInfo('Asia/Kolkata'))
     assert local.isoformat() == '2026-11-02T00:15:00+05:30'
+
+
+def test_health_does_not_issue_or_replace_event_session(client):
+    response = client.get('/api/health')
+    assert 'set-cookie' not in response.headers
+    assert 'gatherly_session' not in client.cookies
+    client.get('/api/events')
+    token = client.cookies.get('gatherly_session')
+    assert token
+    assert 'set-cookie' not in client.get('/api/health').headers
+    assert client.cookies.get('gatherly_session') == token
+
+
+def test_no_op_edits_do_not_create_snapshots(client, event):
+    path = f'/api/events/{event["id"]}'
+    for _ in range(3):
+        response = client.patch(f'{path}/tasks/{event["tasks"][0]["id"]}', json={})
+        assert response.status_code == 200
+        assert response.json()['version'] == event['version']
+    assert len(client.get(f'{path}/revisions').json()) == 1
+
+
+def test_regular_writes_are_rate_limited(client, event, monkeypatch):
+    monkeypatch.setenv('DISABLE_RATE_LIMIT', 'false')
+    path = f'/api/events/{event["id"]}/tasks/{event["tasks"][0]["id"]}'
+    for _ in range(60):
+        assert client.patch(path, json={}).status_code == 200
+    response = client.patch(path, json={})
+    assert response.status_code == 429
+    assert int(response.headers['retry-after']) > 0
+    assert response.headers['x-content-type-options'] == 'nosniff'
+
+
+def test_no_database_connection_held_during_ai(client, app, event, event_input, monkeypatch):
+    calls = []
+    for name in ['generate_plan', 'extract_changes', 'explain_revision', 'compare_vendors']:
+        original = getattr(ai, name)
+        async def checked(*args, original=original, name=name):
+            calls.append(name)
+            assert app.state.db.engine.pool.checkedout() == 0
+            return await original(*args)
+        monkeypatch.setattr(ai, name, checked)
+    assert client.post('/api/events', json=event_input).status_code == 201
+    proposal(client, event['id'])
+    path = f'/api/events/{event["id"]}/vendors'
+    ids = []
+    for name in ['A', 'B']:
+        response = client.post(path, json={'name': name, 'category': 'food', 'quoted_paise': 10000})
+        ids.append(response.json()['vendors'][-1]['id'])
+    assert client.post(path + '/compare', json={'vendor_ids': ids}).status_code == 200
+    assert set(calls) == {'generate_plan', 'extract_changes', 'explain_revision', 'compare_vendors'}
+
+
+def test_event_deleted_during_ai_cannot_leave_orphan_proposal(client, app, event, monkeypatch):
+    from sqlalchemy import func
+    from app.database import ProposalRecord, RevisionRecord
+    original = ai.explain_revision
+    async def deleted(*args):
+        with TestClient(app) as other:
+            other.cookies.update(client.cookies)
+            assert other.delete(f'/api/events/{event["id"]}').status_code == 204
+        return await original(*args)
+    monkeypatch.setattr(ai, 'explain_revision', deleted)
+    response = client.post(f'/api/events/{event["id"]}/proposals', json={'message': MESSAGE, 'request_id': str(uuid4())})
+    assert response.status_code == 404
+    with app.state.db.sessions() as db:
+        for model in [EventRecord, RevisionRecord, ProposalRecord]:
+            assert db.scalar(select(func.count()).select_from(model)) == 0
+
+
+def test_plan_changed_during_ai_rejects_outdated_preview(client, app, event, monkeypatch):
+    original = ai.explain_revision
+    async def changed(*args):
+        with app.state.db.sessions() as db:
+            record = db.get(EventRecord, event['id'])
+            record.version += 1
+            db.commit()
+        return await original(*args)
+    monkeypatch.setattr(ai, 'explain_revision', changed)
+    response = client.post(f'/api/events/{event["id"]}/proposals', json={'message': MESSAGE, 'request_id': str(uuid4())})
+    assert response.status_code == 409
+    assert 'changed while' in response.json()['detail']
+
+
+def test_history_reads_metadata_without_loading_snapshot_json(client, app, event):
+    from sqlalchemy import event as sql_event
+    statements = []
+    def capture(_conn, _cursor, statement, *_args):
+        statements.append(statement)
+    sql_event.listen(app.state.db.engine, 'before_cursor_execute', capture)
+    try:
+        response = client.get(f'/api/events/{event["id"]}/revisions')
+        assert response.status_code == 200
+        assert len(response.json()) == 1
+        assert all('revisions.data' not in statement and 'events.data' not in statement for statement in statements)
+    finally:
+        sql_event.remove(app.state.db.engine, 'before_cursor_execute', capture)
+
+
+def test_production_headers_cache_policy_and_file_boundaries(tmp_path, monkeypatch):
+    from app.main import create_app
+    static = tmp_path / 'dist'
+    (static / 'assets').mkdir(parents=True)
+    (static / 'index.html').write_text('<html>Gatherly</html>')
+    (static / 'assets/app-12345678.js').write_text('export const app = true;')
+    (static / '.env').write_text('private fixture')
+    monkeypatch.setenv('STATIC_DIR', str(static))
+    monkeypatch.setenv('COOKIE_SECURE', 'true')
+    monkeypatch.delenv('GEMINI_API_KEY', raising=False)
+    with TestClient(create_app('sqlite:///:memory:'), base_url='https://testserver') as browser:
+        html = browser.get('/')
+        assert "frame-ancestors 'none'" in html.headers['content-security-policy']
+        assert "script-src 'self';" in html.headers['content-security-policy']
+        assert html.headers['cache-control'] == 'no-cache'
+        assert html.headers['strict-transport-security'] == 'max-age=31536000'
+        assert 'set-cookie' not in html.headers
+        asset = browser.get('/assets/app-12345678.js')
+        assert asset.headers['cache-control'] == 'public, max-age=31536000, immutable'
+        assert 'set-cookie' not in asset.headers
+        assert browser.get('/assets/missing.js').status_code == 404
+        assert browser.get('/.env').status_code == 404
+        blocked = browser.post('/api/events', headers={'Origin': 'https://untrusted.example'})
+        assert blocked.status_code == 403
+        assert blocked.headers['cache-control'] == 'no-store'
+        assert blocked.headers['x-frame-options'] == 'DENY'
+        cookie = browser.get('/api/events').headers['set-cookie'].lower()
+        assert 'secure' in cookie and 'httponly' in cookie

@@ -9,12 +9,16 @@ export async function api<T>(
   path: string,
   method = "GET",
   body?: unknown,
+  options: { signal?: AbortSignal } = {},
 ): Promise<T> {
   const response = await fetch(`/api${path}`, {
     method,
-    credentials: "include",
-    headers: body ? { "Content-Type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
+    credentials: "same-origin",
+    cache: "no-store",
+    signal: options.signal,
+    headers:
+      body !== undefined ? { "Content-Type": "application/json" } : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const data = await response.json().catch(() => null);
   if (!response.ok) {
@@ -35,21 +39,36 @@ export async function api<T>(
   }
   return data as T;
 }
-export const money = (paise: number, options: { compact?: boolean } = {}) =>
+const currencyFormatter = (maximumFractionDigits: number, compact = false) =>
   new Intl.NumberFormat("en-IN", {
     style: "currency",
     currency: "INR",
-    maximumFractionDigits: paise % 100 === 0 ? 0 : 2,
-    ...(options.compact
-      ? { notation: "compact", maximumFractionDigits: 1 }
-      : ({} as object)),
-  }).format(paise / 100);
-export const dateLabel = (date: string, short = false) =>
-  new Date(`${date.slice(0, 10)}T12:00:00`).toLocaleDateString("en-IN", {
-    day: "numeric",
-    month: short ? "short" : "long",
-    ...(short ? {} : { year: "numeric" }),
+    maximumFractionDigits,
+    ...(compact ? { notation: "compact" as const } : {}),
   });
+const wholeCurrency = currencyFormatter(0);
+const fractionalCurrency = currencyFormatter(2);
+const compactCurrency = currencyFormatter(1, true);
+export const money = (paise: number, options: { compact?: boolean } = {}) =>
+  (options.compact
+    ? compactCurrency
+    : paise % 100 === 0
+      ? wholeCurrency
+      : fractionalCurrency
+  ).format(paise / 100);
+const shortDate = new Intl.DateTimeFormat("en-IN", {
+  day: "numeric",
+  month: "short",
+});
+const fullDate = new Intl.DateTimeFormat("en-IN", {
+  day: "numeric",
+  month: "long",
+  year: "numeric",
+});
+export const dateLabel = (date: string, short = false) =>
+  (short ? shortDate : fullDate).format(
+    new Date(`${date.slice(0, 10)}T12:00:00`),
+  );
 export const currencyInput = (value: number | null) =>
   value === null ? "" : String(value / 100);
 export function paise(value: FormDataEntryValue | null) {
