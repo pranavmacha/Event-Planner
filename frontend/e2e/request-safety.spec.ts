@@ -53,6 +53,7 @@ test('switching events cancels a focus refresh without switching back', async ({
   await page.goto('/');
   const switcher = page.getByRole('combobox', { name: 'Switch event', exact: true });
   await expect(switcher).toHaveValue(first.id);
+  await expect(page.getByRole('heading', { name: first.name, exact: true })).toBeVisible();
 
   let delayed: Route | undefined;
   let started!: () => void;
@@ -111,4 +112,81 @@ test('two submissions in the same turn create only one event', async ({ page }) 
   await expect(dialog).not.toBeVisible();
   const saved = await (await page.request.get('/api/events')).json();
   expect(saved).toHaveLength(1);
+});
+
+test('the workspace loads summaries and only fetches the selected full plan', async ({ page }) => {
+  const first = await (await page.request.post('/api/events/sample', { data: {} })).json();
+  const second = await (await page.request.post('/api/events/sample', { data: {} })).json();
+  await page.addInitScript(id => localStorage.setItem('gatherly.activeEvent', id), first.id);
+  const details: string[] = [];
+  page.on('request', request => {
+    const match = new URL(request.url()).pathname.match(/^\/api\/events\/([^/]+)$/);
+    if (request.method() === 'GET' && match) details.push(match[1]);
+  });
+  const summaryResponse = page.waitForResponse(response => response.url().endsWith('/api/events?summary=true'));
+  await page.goto('/');
+  const summaries = await (await summaryResponse).json();
+  expect(summaries).toHaveLength(2);
+  for (const summary of summaries)
+    expect(Object.keys(summary).sort()).toEqual(['city', 'event_date', 'id', 'name', 'occasion', 'version']);
+  await expect(page.getByRole('heading', { name: first.name, exact: true })).toBeVisible();
+  expect(details).toEqual([first.id]);
+
+  const switcher = page.getByRole('combobox', { name: 'Switch event', exact: true });
+  await Promise.all([
+    page.waitForResponse(response => response.url().endsWith(`/api/events/${second.id}`)),
+    switcher.selectOption(second.id),
+  ]);
+  await expect(page.getByRole('heading', { name: second.name, exact: true })).toBeVisible();
+  await Promise.all([
+    page.waitForResponse(response => response.url().endsWith(`/api/events/${first.id}`)),
+    switcher.selectOption(first.id),
+  ]);
+  await expect(page.getByRole('heading', { name: first.name, exact: true })).toBeVisible();
+  // Switching back fetches a fresh plan instead of retaining every full snapshot.
+  expect(details).toEqual([first.id, second.id, first.id]);
+});
+
+test('switching while a plan loads prevents its late response from replacing the selection', async ({ page }) => {
+  const first = await (await page.request.post('/api/events/sample', { data: {} })).json();
+  const second = await (await page.request.post('/api/events/sample', { data: {} })).json();
+  await page.addInitScript(id => localStorage.setItem('gatherly.activeEvent', id), first.id);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: first.name, exact: true })).toBeVisible();
+
+  let delayed: Route | undefined;
+  let started!: () => void;
+  const detailStarted = new Promise<void>(resolve => { started = resolve; });
+  await page.route(`**/api/events/${second.id}`, route => {
+    delayed = route;
+    started();
+  });
+  const switcher = page.getByRole('combobox', { name: 'Switch event', exact: true });
+  await switcher.selectOption(second.id);
+  await detailStarted;
+  await expect(page.getByText('Loading your celebration…', { exact: true })).toBeVisible();
+  await switcher.selectOption(first.id);
+  await expect(page.getByRole('heading', { name: first.name, exact: true })).toBeVisible();
+  await delayed!.fulfill({ json: { ...second, name: 'The other celebration' } });
+  await settleRender(page);
+  await expect(switcher).toHaveValue(first.id);
+  await expect(page.getByRole('heading', { name: first.name, exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'The other celebration', exact: true })).not.toBeVisible();
+});
+
+test('a failed selected plan can be retried without losing the event switcher', async ({ page }) => {
+  const saved = await (await page.request.post('/api/events/sample', { data: {} })).json();
+  let attempts = 0;
+  await page.route(`**/api/events/${saved.id}`, route => {
+    attempts += 1;
+    return attempts === 1
+      ? route.fulfill({ status: 503, json: { detail: 'Please try loading this celebration again.' } })
+      : route.continue();
+  });
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'Your celebration needs a moment.', exact: true })).toBeVisible();
+  await expect(page.getByRole('combobox', { name: 'Switch event', exact: true })).toHaveValue(saved.id);
+  await page.getByRole('button', { name: 'Try again', exact: true }).click();
+  await expect(page.getByRole('heading', { name: saved.name, exact: true })).toBeVisible();
+  expect(attempts).toBe(2);
 });

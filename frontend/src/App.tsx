@@ -39,6 +39,7 @@ import type {
   BudgetItem,
   Comparison,
   EventInput,
+  EventSummary,
   PlanningEvent,
   Proposal,
   Revision,
@@ -73,8 +74,12 @@ function rememberedEvent() {
   }
 }
 export default function App() {
-  const [events, setEvents] = useState<PlanningEvent[]>([]);
+  const [events, setEvents] = useState<EventSummary[]>([]);
+  const [activeEvent, setActiveEvent] = useState<PlanningEvent | null>(null);
   const [activeId, setActiveId] = useState("");
+  const activeIdRef = useRef("");
+  const [eventLoading, setEventLoading] = useState(false);
+  const [eventError, setEventError] = useState("");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [mode, setMode] = useState("demo");
@@ -99,39 +104,81 @@ export default function App() {
   const [restore, setRestore] = useState<Revision | null>(null);
   const operationPending = useRef(false);
   const workspaceRequest = useRef<AbortController | null>(null);
+  const eventRequest = useRef<AbortController | null>(null);
   const pendingRequest = useRef<{
     eventId: string;
     message: string;
     id: string;
   } | null>(null);
-  const event = events.find((e) => e.id === activeId);
+  const event = activeEvent?.id === activeId ? activeEvent : null;
   const isBusy = !!busy;
   const modalIsOpen = Boolean(
     wizard || editor || assistantOpen || proposalOpen || comparison || restore,
   );
   const adopt = useCallback((updated: PlanningEvent, select = true) => {
+    if (select) {
+      eventRequest.current?.abort();
+      eventRequest.current = null;
+      activeIdRef.current = updated.id;
+      setActiveId(updated.id);
+      setEventLoading(false);
+      setEventError("");
+      rememberEvent(updated.id);
+    } else if (activeIdRef.current !== updated.id) {
+      return;
+    }
+    setActiveEvent((previous) =>
+      previous?.id === updated.id && previous.version > updated.version
+        ? previous
+        : updated,
+    );
+    const { id, name, occasion, city, event_date, version } = updated;
+    const summary: EventSummary = { id, name, occasion, city, event_date, version };
     setEvents((list) => {
       const existing = list.find((e) => e.id === updated.id);
       // A read started before a save may finish after it. Never roll the UI back.
       if (existing && existing.version > updated.version) return list;
       return existing
-        ? list.map((e) => (e.id === updated.id ? updated : e))
-        : [updated, ...list];
+        ? list.map((e) => (e.id === updated.id ? summary : e))
+        : [summary, ...list];
     });
-    if (select) {
-      setActiveId(updated.id);
-      rememberEvent(updated.id);
-    }
   }, []);
+  const loadEvent = useCallback(async (id: string) => {
+    eventRequest.current?.abort();
+    const controller = new AbortController();
+    eventRequest.current = controller;
+    activeIdRef.current = id;
+    setActiveId(id);
+    // Keep only the selected full plan in memory; the switcher uses summaries.
+    setActiveEvent(null);
+    setEventLoading(true);
+    setEventError("");
+    rememberEvent(id);
+    try {
+      const updated = await api<PlanningEvent>(`/events/${id}`, "GET", undefined, {
+        signal: controller.signal,
+      });
+      if (!controller.signal.aborted) adopt(updated, false);
+    } catch (error) {
+      if (!controller.signal.aborted && activeIdRef.current === id)
+        setEventError(error instanceof Error ? error.message : "Could not load your celebration.");
+    } finally {
+      if (eventRequest.current === controller) {
+        eventRequest.current = null;
+        if (!controller.signal.aborted) setEventLoading(false);
+      }
+    }
+  }, [adopt]);
   const load = useCallback(async () => {
     workspaceRequest.current?.abort();
+    eventRequest.current?.abort();
     const controller = new AbortController();
     workspaceRequest.current = controller;
     setLoading(true);
     setLoadError("");
     try {
       const [list, health] = await Promise.all([
-        api<PlanningEvent[]>("/events", "GET", undefined, {
+        api<EventSummary[]>("/events?summary=true", "GET", undefined, {
           signal: controller.signal,
         }),
         api<{ ai_mode: string }>("/health", "GET", undefined, {
@@ -142,9 +189,16 @@ export default function App() {
       setEvents(list);
       setMode(health.ai_mode);
       const saved = rememberedEvent();
-      setActiveId(
-        list.some((e) => e.id === saved) ? saved! : list[0]?.id || "",
-      );
+      const selected = list.some((e) => e.id === saved) ? saved! : list[0]?.id;
+      if (selected) {
+        void loadEvent(selected);
+      } else {
+        activeIdRef.current = "";
+        setActiveId("");
+        setActiveEvent(null);
+        setEventLoading(false);
+        setEventError("");
+      }
     } catch (error) {
       if (controller.signal.aborted) return;
       setLoadError(
@@ -158,10 +212,13 @@ export default function App() {
         if (!controller.signal.aborted) setLoading(false);
       }
     }
-  }, []);
+  }, [loadEvent]);
   useEffect(() => {
     void load();
-    return () => workspaceRequest.current?.abort();
+    return () => {
+      workspaceRequest.current?.abort();
+      eventRequest.current?.abort();
+    };
   }, [load]);
   useEffect(() => {
     if (!toast || toast.error) return;
@@ -193,6 +250,8 @@ export default function App() {
     const refresh = () => {
       if (
         !activeId ||
+        activeIdRef.current !== activeId ||
+        eventRequest.current ||
         operationPending.current ||
         controller ||
         Date.now() - lastRefresh < 5000
@@ -399,8 +458,7 @@ export default function App() {
   };
   const switchEvent = (id: string) => {
     if (operationPending.current) return;
-    setActiveId(id);
-    rememberEvent(id);
+    void loadEvent(id);
     setView("overview");
     setProposal(null);
     setProposalOpen(false);
@@ -410,6 +468,7 @@ export default function App() {
     setEditor(null);
     setRestore(null);
     setAssistantOpen(false);
+    setRevisions([]);
   };
   const navigate = (v: View) => {
     setView(v);
@@ -461,7 +520,7 @@ export default function App() {
           <button
             className="new-event-button"
             onClick={() => setWizard(true)}
-            disabled={isBusy || loading}
+            disabled={isBusy || loading || eventLoading}
           >
             <Plus size={16} />
             New event
@@ -557,6 +616,21 @@ export default function App() {
                 For local development, start the API server on port 8000 and
                 reload.
               </p>
+            </div>
+          ) : eventLoading ? (
+            <Spinner label="Loading your celebration…" />
+          ) : eventError ? (
+            <div className="load-error panel">
+              <AlertCircle size={30} />
+              <h1>Your celebration needs a moment.</h1>
+              <p>{eventError}</p>
+              <button
+                className="button button-primary"
+                onClick={() => void loadEvent(activeId)}
+              >
+                Try again
+              </button>
+              <p className="muted small">You can also choose another celebration.</p>
             </div>
           ) : !event ? (
             <div className="welcome">

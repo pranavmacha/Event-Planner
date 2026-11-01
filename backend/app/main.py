@@ -9,7 +9,9 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import date, timezone
 from pathlib import Path
+from threading import Lock
 
+from anyio import fail_after, from_thread
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -31,12 +33,18 @@ from .schemas import (BudgetInput, BudgetPatch, Changes, CompareInput, EventInpu
 
 COOKIE_NAME = 'gatherly_session'
 MAX_BODY_BYTES = 128 * 1024
+BODY_TIMEOUT_SECONDS = 10
 DEFAULT_ORIGINS = 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000'
 
 
 def create_app(database_url: str | None = None) -> FastAPI:
     database = Database(database_url)
     limiter = RateLimiter()
+    # Fixed-size stripes bound lock memory even when clients rotate session IDs.
+    creation_locks = [Lock() for _ in range(64)]
+    on_render = os.getenv('RENDER', '').lower() == 'true'
+    secure_cookie = (os.getenv('COOKIE_SECURE', 'false').lower() == 'true'
+                     or on_render)
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -44,7 +52,10 @@ def create_app(database_url: str | None = None) -> FastAPI:
         yield
         database.engine.dispose()
 
-    app = FastAPI(title='Gatherly', version='1.0.0', lifespan=lifespan)
+    app = FastAPI(title='Gatherly', version='1.0.0', lifespan=lifespan,
+                  docs_url=None if on_render else '/docs',
+                  redoc_url=None if on_render else '/redoc',
+                  openapi_url=None if on_render else '/openapi.json')
     app.state.db = database
     app.state.limiter = limiter
     origins = [origin.strip().rstrip('/') for origin in os.getenv('ALLOWED_ORIGINS', DEFAULT_ORIGINS).split(',') if origin.strip()]
@@ -70,15 +81,6 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 return JSONResponse({'detail': 'Invalid request size.'}, status_code=400)
             if declared_size > MAX_BODY_BYTES:
                 return JSONResponse({'detail': 'Request is too large (maximum 128 KiB).'}, status_code=413)
-            if request.method not in ['GET', 'HEAD', 'OPTIONS']:
-                size = 0
-                chunks = []
-                async for chunk in request.stream():
-                    size += len(chunk)
-                    if size > MAX_BODY_BYTES:
-                        return JSONResponse({'detail': 'Request is too large (maximum 128 KiB).'}, status_code=413)
-                    chunks.append(chunk)
-                request._body = b''.join(chunks)
         # Health probes and static resources must not replace an event session
         # when the browser's first requests run concurrently.
         needs_session = request.url.path == '/api/events' or request.url.path.startswith('/api/events/')
@@ -89,15 +91,36 @@ def create_app(database_url: str | None = None) -> FastAPI:
             if is_new:
                 token = secrets.token_urlsafe(32)
             request.state.owner_hash = hashlib.sha256(token.encode()).hexdigest()
-            if request.method not in ['GET', 'HEAD', 'OPTIONS']:
-                try:
+            try:
+                if request.method in ['GET', 'HEAD']:
+                    limiter.check_read(request)
+                elif request.method != 'OPTIONS':
                     limiter.check_write(request)
-                except HTTPException as exc:
-                    return JSONResponse({'detail': exc.detail}, status_code=exc.status_code, headers=exc.headers)
+            except HTTPException as exc:
+                return JSONResponse({'detail': exc.detail}, status_code=exc.status_code, headers=exc.headers)
+        # Reject exhausted clients before consuming their upload. Bound both bytes
+        # and elapsed time, including requests without a Content-Length header.
+        if request.url.path.startswith('/api') and request.method not in ['GET', 'HEAD', 'OPTIONS']:
+            media_type = request.headers.get('content-type', '').split(';', 1)[0].strip().lower()
+            is_json = media_type == 'application/json' or bool(re.fullmatch(r'application/[a-z0-9!#$&^_.+-]+\+json', media_type))
+            size = 0
+            chunks = []
+            try:
+                with fail_after(BODY_TIMEOUT_SECONDS):
+                    async for chunk in request.stream():
+                        size += len(chunk)
+                        if size > MAX_BODY_BYTES:
+                            return JSONResponse({'detail': 'Request is too large (maximum 128 KiB).'}, status_code=413)
+                        if size and not is_json:
+                            return JSONResponse({'detail': 'Use Content-Type: application/json for request bodies.'}, status_code=415)
+                        chunks.append(chunk)
+            except TimeoutError:
+                return JSONResponse({'detail': 'Request upload took too long. Please retry.'}, status_code=408)
+            request._body = b''.join(chunks)
         response = await call_next(request)
         if is_new:
             response.set_cookie(COOKIE_NAME, token, max_age=365 * 24 * 60 * 60,
-                                httponly=True, secure=os.getenv('COOKIE_SECURE', 'false').lower() == 'true',
+                                httponly=True, secure=secure_cookie,
                                 samesite='strict', path='/')
         return response
 
@@ -108,7 +131,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         response.headers['X-Frame-Options'] = 'DENY'
         response.headers['Referrer-Policy'] = 'same-origin'
         response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
-        if os.getenv('COOKIE_SECURE', 'false').lower() == 'true':
+        if secure_cookie:
             response.headers['Strict-Transport-Security'] = 'max-age=31536000'
         if request.url.path.startswith('/api'):
             response.headers['Cache-Control'] = 'no-store'
@@ -192,7 +215,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
         item.update(clean)
         return expected
 
-    async def create_event_from_input(payload: EventInput, request: Request, db: Session):
+    # Sync endpoints run blocking SQLAlchemy work in FastAPI workers. Only the
+    # model coroutine returns to the server loop, preserving its shared AI limit.
+    def create_event_from_input(payload: EventInput, request: Request, db: Session):
         limiter.check(request)
         if payload.event_date < today():
             raise HTTPException(422, 'Choose an event date today or in the future.')
@@ -201,15 +226,17 @@ def create_app(database_url: str | None = None) -> FastAPI:
             raise HTTPException(422, 'This browser has reached the 30-event limit. Remove an older event first.')
         db.close()  # Release the pooled connection before waiting on Gemini.
         base = payload.model_dump(mode='json')
-        generated = await ai.generate_plan(base)
+        generated = from_thread.run(ai.generate_plan, base)
         event = baseline_plan(base, generated, ai.get_mode())
-        count = db.scalar(select(func.count()).select_from(EventRecord).where(EventRecord.owner_hash == request.state.owner_hash))
-        if count >= 30:
-            raise HTTPException(422, 'This browser has reached the 30-event limit. Remove an older event first.')
-        record = EventRecord(id=event['id'], owner_hash=request.state.owner_hash, version=1, data=event)
-        db.add(record)
-        revision(db, record, 'Original generated plan')
-        db.commit()
+        owner_lock = creation_locks[int(request.state.owner_hash[:8], 16) % len(creation_locks)]
+        with owner_lock:
+            count = db.scalar(select(func.count()).select_from(EventRecord).where(EventRecord.owner_hash == request.state.owner_hash))
+            if count >= 30:
+                raise HTTPException(422, 'This browser has reached the 30-event limit. Remove an older event first.')
+            record = EventRecord(id=event['id'], owner_hash=request.state.owner_hash, version=1, data=event)
+            db.add(record)
+            revision(db, record, 'Original generated plan')
+            db.commit()
         return event
 
     @app.get('/api/health')
@@ -217,16 +244,25 @@ def create_app(database_url: str | None = None) -> FastAPI:
         return {'status': 'ok', 'ai_mode': ai.get_mode()}
 
     @app.get('/api/events')
-    def list_events(request: Request, db: Session = Depends(get_db)):
+    def list_events(request: Request, summary: bool = False, db: Session = Depends(get_db)):
+        if summary:
+            # Project only the switcher's fields in SQL. Large task/vendor JSON
+            # never enters Python memory for plans the user has not opened.
+            fields = ('name', 'occasion', 'city', 'event_date')
+            rows = db.execute(select(EventRecord.id, EventRecord.version,
+                *(EventRecord.data[key].as_string().label(key) for key in fields))
+                .where(EventRecord.owner_hash == request.state.owner_hash)
+                .order_by(EventRecord.created_at.desc())).mappings()
+            return [dict(row) for row in rows]
         records = db.scalars(select(EventRecord).where(EventRecord.owner_hash == request.state.owner_hash).order_by(EventRecord.created_at.desc())).all()
         return [current_event(record) for record in records]
 
     @app.post('/api/events', status_code=201)
-    async def create_event(payload: EventInput, request: Request, db: Session = Depends(get_db)):
-        return await create_event_from_input(payload, request, db)
+    def create_event(payload: EventInput, request: Request, db: Session = Depends(get_db)):
+        return create_event_from_input(payload, request, db)
 
     @app.post('/api/events/sample', status_code=201)
-    async def create_sample(request: Request, db: Session = Depends(get_db)):
+    def create_sample(request: Request, db: Session = Depends(get_db)):
         now = today()
         month_index = now.month - 1 + 4
         year = now.year + month_index // 12
@@ -240,7 +276,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
             dietary_preferences='Vegetarian menu with clearly labeled Jain and allergy-aware options',
             accessibility_needs='Step-free access, accessible washrooms, seating for older guests',
             cultural_preferences='A welcoming Indian family celebration with a ceremony and reception')
-        return await create_event_from_input(payload, request, db)
+        return create_event_from_input(payload, request, db)
 
     @app.get('/api/events/{event_id}')
     def get_event(event_id: str, request: Request, db: Session = Depends(get_db)):
@@ -348,7 +384,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         return result
 
     @app.post('/api/events/{event_id}/vendors/compare')
-    async def compare(event_id: str, payload: CompareInput, request: Request, db: Session = Depends(get_db)):
+    def compare(event_id: str, payload: CompareInput, request: Request, db: Session = Depends(get_db)):
         record = owned_event(event_id, request, db)
         if len(set(payload.vendor_ids)) != len(payload.vendor_ids):
             raise HTTPException(422, 'Choose at least two different vendor options.')
@@ -356,7 +392,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         limiter.check(request)
         snapshot = current_event(record)
         db.close()
-        return await ai.compare_vendors(snapshot, vendors)
+        return from_thread.run(ai.compare_vendors, snapshot, vendors)
 
     def proposal_response(record: ProposalRecord):
         return {**record.data, 'id': record.id, 'base_version': record.base_version, 'status': record.status, 'message': record.message}
@@ -368,7 +404,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         return proposal
 
     @app.post('/api/events/{event_id}/proposals')
-    async def propose(event_id: str, payload: ProposalInput, request: Request, db: Session = Depends(get_db)):
+    def propose(event_id: str, payload: ProposalInput, request: Request, db: Session = Depends(get_db)):
         record = owned_event(event_id, request, db)
         existing = db.scalar(select(ProposalRecord).where(ProposalRecord.event_id == event_id, ProposalRecord.request_id == payload.request_id))
         if existing:
@@ -379,7 +415,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         before = current_event(record)
         base_version = record.version
         db.close()
-        extracted = await ai.extract_changes(payload.message, before)
+        extracted = from_thread.run(ai.extract_changes, payload.message, before)
         if extracted.get('clarification'):
             return {'clarification': extracted['clarification'], 'ai_mode': ai.get_mode()}
         try:
@@ -392,7 +428,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         if 'event_date' in changes and date.fromisoformat(changes['event_date']) < today():
             raise HTTPException(422, 'The proposed event date is in the past. Please choose today or a future date.')
         after, impacts = revise_plan(before, changes)
-        explanation = await ai.explain_revision(before, after, impacts)
+        explanation = from_thread.run(ai.explain_revision, before, after, impacts)
         data = dict(changes=changes, before=before, after=after,
                     category_impacts=impacts['category_impacts'], task_impacts=impacts['task_impacts'],
                     tradeoffs=explanation.get('tradeoffs', []),

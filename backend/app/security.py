@@ -56,3 +56,9 @@ class RateLimiter:
         ip = request.client.host if request.client else 'unknown'
         self._consume([(f'write:ip:{ip}', 180, 60), (f'write:owner:{owner}', 60, 60)],
                       'Too many changes. Please wait and retry.')
+
+    def check_read(self, request: Request):
+        owner = request.state.owner_hash
+        ip = request.client.host if request.client else 'unknown'
+        self._consume([(f'read:ip:{ip}', 600, 60), (f'read:owner:{owner}', 240, 60)],
+                      'Too many plan requests. Please wait and retry.')

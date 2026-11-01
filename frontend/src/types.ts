@@ -107,6 +107,10 @@ export interface PlanningEvent extends EventInput {
   vendors: Vendor[];
   summary: Summary;
 }
+export type EventSummary = Pick<
+  PlanningEvent,
+  "id" | "name" | "occasion" | "city" | "event_date" | "version"
+>;
 export interface Proposal {
   id: string;
   base_version: number;

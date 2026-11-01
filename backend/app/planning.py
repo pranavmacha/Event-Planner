@@ -31,7 +31,11 @@ def new_id() -> str:
 
 
 def project_item(item: dict, guest_count: int) -> dict:
-    item = deepcopy(item)
+    return _project_item_in_place(deepcopy(item), guest_count)
+
+
+def _project_item_in_place(item: dict, guest_count: int) -> dict:
+    """Recalculate a row already owned by this operation."""
     estimate = item['estimate_paise'] * (guest_count if item['cost_type'] == 'per_person' else 1)
     basis = 'estimated'
     amount = estimate
@@ -83,12 +87,14 @@ def validate_dependencies(tasks: list[dict]) -> None:
 
 
 def enrich_tasks(tasks: list[dict], event_date: str, as_of: date) -> list[dict]:
+    return _enrich_tasks_in_place(deepcopy(tasks), date.fromisoformat(event_date), as_of)
+
+
+def _enrich_tasks_in_place(tasks: list[dict], event_day: date, as_of: date) -> list[dict]:
     by_id = {task['id']: task for task in tasks}
-    event_day = date.fromisoformat(event_date)
     due_dates = {task['id']: date.fromisoformat(task['due_date'])
                  for task in tasks if task['status'] != 'done'}
-    result = deepcopy(tasks)
-    for task in result:
+    for task in tasks:
         reasons = []
         if task['status'] == 'done':
             task.update(readiness='done', reasons=['Completed.'])
@@ -118,21 +124,29 @@ def enrich_tasks(tasks: list[dict], event_date: str, as_of: date) -> list[dict]:
             reasons.append(f'{label} ({len(predecessors)}): {examples}{suffix}.')
         task['readiness'] = 'at_risk' if risk else 'blocked' if waiting else 'ready'
         task['reasons'] = reasons or ['All prerequisites are complete; this task is ready to start.']
-    return result
+    return tasks
 
 
 def enrich_event(data: dict, version: int | None = None, as_of: date | None = None) -> dict:
-    event = deepcopy(data)
-    as_of = as_of or today()
+    # One defensive copy owns all nested records. Reusing that copy avoids
+    # allocating a second task graph and second set of budget rows on every read.
+    return _enrich_event_in_place(deepcopy(data), version, as_of or today())
+
+
+def _enrich_event_in_place(event: dict, version: int | None, as_of: date) -> dict:
     if version is not None:
         event['version'] = version
-    event['budget_items'] = [project_item(item, event['guest_count']) for item in event['budget_items']]
-    event['tasks'] = enrich_tasks(event['tasks'], event['event_date'], as_of)
+    event_day = date.fromisoformat(event['event_date'])
+    _enrich_tasks_in_place(event['tasks'], event_day, as_of)
     for vendor in event.get('vendors', []):
         vendor['total_paise'] = safe_money(vendor['quoted_paise'] + vendor['taxes_paise'] + vendor['additional_charges_paise'])
     totals = {category: 0 for category in CATEGORIES}
+    committed = actual = 0
     for item in event['budget_items']:
+        _project_item_in_place(item, event['guest_count'])
         totals[item['category']] += item['projected_paise']
+        committed += item['committed_paise'] or 0
+        actual += item['actual_paise'] or 0
     projected = safe_money(sum(totals.values()))
     reserve = event['budget_paise'] // 10
     safe_money(projected + reserve)
@@ -142,9 +156,9 @@ def enrich_event(data: dict, version: int | None = None, as_of: date | None = No
         'reserve_paise': reserve,
         'remaining_paise': remaining,
         'overspend_paise': max(0, -remaining),
-        'committed_paise': sum(item['committed_paise'] or 0 for item in event['budget_items']),
-        'actual_paise': sum(item['actual_paise'] or 0 for item in event['budget_items']),
-        'days_remaining': (date.fromisoformat(event['event_date']) - as_of).days,
+        'committed_paise': committed,
+        'actual_paise': actual,
+        'days_remaining': (event_day - as_of).days,
         'completed_tasks': sum(task['status'] == 'done' for task in event['tasks']),
         'total_tasks': len(event['tasks']),
         'category_totals': totals,
@@ -218,7 +232,7 @@ def baseline_plan(event: dict, ai_result: dict, mode: str) -> dict:
 def revise_plan(before: dict, changes: dict) -> tuple[dict, dict]:
     after = deepcopy(before)
     old_day = date.fromisoformat(before['event_date'])
-    after.update(changes)
+    after.update(deepcopy(changes))
     # A generated concept may contain old counts or dates. Refresh its factual
     # framing from preferences instead of carrying stale prose into the revision.
     after['concept'] = (f"{after['name']}: a {after['atmosphere'].lower() or 'joyful'} {after['occasion'].lower()} "
@@ -236,7 +250,7 @@ def revise_plan(before: dict, changes: dict) -> tuple[dict, dict]:
                 raise PlanningValidationError('A task deadline cannot move by this date change because it would fall outside the supported calendar. Correct the task date and retry.') from None
             task_impacts.append(dict(id=task['id'], title=task['title'], before_date=before_date,
                 after_date=task['due_date'], reason=f'Deadline moves with the event date ({delta.days:+d} days). Completed tasks keep their dates.'))
-    after = enrich_event(after, before['version'] + 1)
+    after = _enrich_event_in_place(after, before['version'] + 1, today())
     category_impacts = []
     for category in CATEGORIES:
         old_total = before['summary']['category_totals'][category]

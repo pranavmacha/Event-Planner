@@ -67,3 +67,44 @@ The initial live extraction check passed with `gemini-3.8-flash`, but the user's
 - A deliberately large synthetic 200-task case decreased from 5,561,792 bytes of enriched task JSON to 1,260,682 bytes (about 77% smaller) by bounding repeated dependency explanations. All prerequisite IDs and readiness checks remain intact. This is a stress fixture, not a production traffic benchmark.
 - A synthetic extraction fixture with over 160 KB of unrelated task data now sends less than 2 KB of relevant JSON to the mocked AI boundary.
 - `npm audit` reported zero known vulnerabilities. `pip-audit` checked all 44 pinned Python dependencies, skipped none, and found no known vulnerabilities; the scanner ran in a temporary environment without changing project dependencies. These changes do not migrate the database or remove existing history. Existing PostgreSQL/deployment limits above still apply; no live model calls or remote deployment were performed in this follow-up.
+
+## Measured resource improvements after evaluator feedback
+
+The user reported that the updated GitHub repository scored efficiency 80→80, security 84→84 and code quality 86→88. The evaluator supplied no detailed findings in this conversation. The following measurements demonstrate specific improvements; they do not predict a new evaluator percentage.
+
+Planning measurements compare commit `efc827d` with the current implementation, using Python 3.12.16 on the same local machine. The synthetic fixture contains 200 budget items, 200 tasks, 100 vendors and 8,725 dependency edges (678 KB of enriched JSON). Each timing is the median of seven batches of 50 operations, without tracing enabled. Memory is the median incremental peak of seven separately traced operations; input allocation is excluded. It is **not total process RAM**.
+
+| Operation | Before | After | Reduction |
+| --- | ---: | ---: | ---: |
+| Event recalculation time | 4.334 ms | 2.588 ms | 40% |
+| Event recalculation peak Python allocation | 576,457 bytes | 408,490 bytes | 29% |
+| Plan revision time | 6.392 ms | 2.646 ms | 59% |
+| Plan revision peak Python allocation | 907,435 bytes | 437,929 bytes | 52% |
+
+The implementation copies nested inputs once, reuses that owned copy throughout calculation, and combines budget projection/aggregation into one pass. Input immutability and day-dependent readiness remain covered. A differential check of 100 seeded dense-plan cases matched the previous implementation for both recalculation and revisions.
+
+A separate temporary SQLite benchmark seeded 30 synthetic plans at those record limits. It compares the legacy full-list endpoint with the new summary-list endpoint plus one selected full plan, both on the current backend. Timing is the median of five batches of three reads through TestClient; it includes request handling and serialization but excludes real-network latency and browser rendering. Tracing runs separately. Switching events now makes a detail request instead of retaining all full plans in browser state; this adds a round trip while reducing the initial transfer and retained data.
+
+| Workspace read | All 30 full plans | Summaries + selected plan |
+| --- | ---: | ---: |
+| Response bytes | 18,828,891 | 631,459 (97% less) |
+| Median request time | 311.077 ms | 22.372 ms (93% less) |
+| Peak Python allocations | 86,832,383 bytes | 3,008,444 bytes (97% less) |
+
+Reproduce from the repository root:
+
+```sh
+backend/.venv/bin/python scripts/benchmark_planning.py
+backend/.venv/bin/python scripts/benchmark_workspace.py
+```
+
+To reproduce the planning baseline, export `backend/app/planning.py` from `efc827d` to a temporary file and pass that path to `benchmark_planning.py --planning-module PATH`. These scripts use synthetic data, do not call Gemini and do not touch saved user events. Performance varies with hardware and dataset size; these are stress fixtures, not a production traffic study.
+
+Additional changes and validation:
+
+- **117 backend tests passed** in 2.07 seconds; `pip check` passed. New checks prove that blocked SQL work leaves the server loop responsive for all four AI routes, connections remain released during AI, concurrent creations respect the 30-event quota, and summary reads preserve ownership without enriching full plans.
+- Production frontend build passed; **11 browser tests passed**, including initial selective loading, changing selection during a delayed fetch, failed-detail retry, the existing planning journey, accessibility, mobile, stale-read protection and production CSP checks.
+- Uploads now have a 10-second deadline, enforce the byte limit on chunked bodies, require JSON media types for nonempty bodies, and check write limits before consuming the upload. Event reads have separate rate limits. Tests cover timeout, oversize, unsupported media type, early rejection and health-probe availability.
+- Render automatically enforces Secure cookies/HSTS and disables interactive documentation/OpenAPI. Detection uses Render's documented `RENDER=true` environment variable ([Render documentation](https://render.com/docs/environment-variables)). Local HTTP remains supported. Blocking database work runs in FastAPI workers; AI calls return to the shared server loop through [AnyIO's worker-thread bridge](https://anyio.readthedocs.io/en/stable/threads.html#calling-asynchronous-code-from-a-worker-thread).
+- Bandit reports zero findings with no suppressions; Python and frontend dependency audits report no known vulnerabilities. GitHub Actions now runs these scans on pushes and PRs with read-only repository permissions. This is targeted testing and automated scanning, not a comprehensive penetration test.
+- Creation quota locks and rate limits remain process-local: the deployment still requires one worker. Revision/proposal snapshots are retained until their event is deleted; ongoing storage monitoring and an explicit retention policy remain necessary for long-lived deployments. No saved data was deleted, no live AI calls were made, and no push or deployment was performed during this pass. Temporary test servers were stopped.

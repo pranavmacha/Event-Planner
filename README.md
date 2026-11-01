@@ -43,7 +43,7 @@ Official references: [Google Gen AI Python SDK](https://github.com/googleapis/py
 | `GEMINI_MODEL` | Configurable Gemini model supporting structured output |
 | `DATABASE_URL` | SQLAlchemy URL; SQLite by default, `postgresql+psycopg://…` supported |
 | `ALLOWED_ORIGINS` | Comma-separated explicit trusted frontend origins; no wildcard |
-| `COOKIE_SECURE` | `false` for localhost HTTP; `true` behind production HTTPS |
+| `COOKIE_SECURE` | `false` for localhost HTTP; `true` behind production HTTPS (automatically enforced on Render) |
 | `STATIC_DIR` | Built frontend path served by FastAPI; Docker configures this automatically |
 
 Do not commit `.env`, databases, cookies or credentials. `.env.example` contains only placeholders.
@@ -69,11 +69,11 @@ Vendor comparison does not commit an expense or book anyone. Transfer a chosen q
 
 ## Persistence, ownership and concurrency
 
-A high-entropy anonymous HttpOnly cookie identifies the browser; the database stores its hash. Every event and child-record route checks ownership and returns 404 for inaccessible IDs. SameSite cookies, explicit trusted-origin validation and deliberate CORS configuration protect browser mutations. Requests are limited to 128 KiB and fields have explicit bounds. AI endpoints share rolling limits of 12 requests per browser per minute, 120 per browser per hour and 30 per source IP per minute. The source IP is the address visible to the application; trusted proxy handling must be configured for the deployment.
+A high-entropy anonymous HttpOnly cookie identifies the browser; the database stores its hash. Every event and child-record route checks ownership and returns 404 for inaccessible IDs. SameSite cookies, explicit trusted-origin validation and deliberate CORS configuration protect browser mutations. Requests are limited to 128 KiB and a 10-second upload deadline, including chunked bodies. Nonempty API bodies require a JSON content type, and fields have explicit bounds. AI endpoints share rolling limits of 12 requests per browser per minute, 120 per browser per hour and 30 per source IP per minute. The source IP is the address visible to the application; trusted proxy handling must be configured for the deployment.
 
-All event writes also share limits of 60 per browser and 180 per IP per minute. Rate-limit tracking has a hard 10,000-key ceiling and rejects new traffic at capacity without evicting active limits. At most four Gemini requests run concurrently per server event loop. Database connections are released while waiting for AI, and proposal writes recheck and lock the event to avoid saving previews for changed or deleted plans. No-op edits create no additional version or history snapshot; history listings select metadata only.
+All event writes also share limits of 60 per browser and 180 per IP per minute, checked before reading the upload. Event reads are limited to 240 per browser and 600 per IP per minute; health probes remain available. Rate-limit tracking has a hard 10,000-key ceiling and rejects new traffic at capacity without evicting active limits. At most four Gemini requests run concurrently per server event loop. Blocking database operations run in worker threads, with only model coroutines scheduled on the shared server loop. Database connections are released while waiting for AI, and proposal writes recheck and lock the event to avoid saving previews for changed or deleted plans. No-op edits create no additional version or history snapshot; history listings select metadata only. Workspace listings select six summary fields in SQL, and the frontend retains only the active full plan. Planning transformations make one defensive copy of nested data rather than copying the task graph repeatedly. Concurrent creations serialize their final count/write within the single worker to enforce the 30-event limit.
 
-The production frontend has a same-origin Content Security Policy (inline styles remain enabled for progress charts), frame blocking, and restrictive browser permissions. HTTPS deployments with `COOKIE_SECURE=true` send HSTS. API responses are not cached; hashed build assets use immutable caching and HTML revalidates. Health probes and static files do not issue session cookies. The frontend cancels superseded reads, rejects older response versions, and blocks duplicate submissions before a second write starts.
+The production frontend has a same-origin Content Security Policy (inline styles remain enabled for progress charts), frame blocking, and restrictive browser permissions. HTTPS deployments with `COOKIE_SECURE=true` send HSTS. Render automatically enforces secure cookies and HSTS and disables the interactive API documentation, even if the cookie setting is omitted. API responses are not cached; hashed build assets use immutable caching and HTML revalidates. Health probes and static files do not issue session cookies. The frontend cancels superseded reads, rejects older response versions, and blocks duplicate submissions before a second write starts.
 
 Clearing cookies loses access to that anonymous browser's events. There is no account recovery or cross-device login in this MVP. Do not clear cookies if you want to resume your plans.
 
@@ -110,7 +110,7 @@ For HTTPS deployment on a container host:
 2. Set `COOKIE_SECURE=true` and `ALLOWED_ORIGINS=https://YOUR_APP_HOST`.
 3. Keep a persistent disk mounted at `/data` for SQLite, or set a managed PostgreSQL `DATABASE_URL` in the running container. The included Compose file fixes `DATABASE_URL` to its SQLite volume; edit that service environment entry to use PostgreSQL. Changing only the root `.env` database URL does not override the Compose entry. Back up the database.
 4. Set the Gemini secret through the host's secret configuration. Keep it out of the image and repository.
-5. Use one application worker for the MVP's process-local rate limiter. A shared rate-limit store is needed before scaling across workers/replicas. SQLite likewise suits a single instance; use PostgreSQL for multi-instance durability.
+5. Use one application worker for the MVP's process-local rate limiter. Shared rate limits and a database-backed event-creation quota lock are needed before scaling across workers/replicas. SQLite likewise suits a single instance; use PostgreSQL for multi-instance durability.
 6. Check `/api/health`, then run the create/change/restore journey over HTTPS. Verify the cookie's Secure attribute and your allowed origin.
 
 ### Render
@@ -141,3 +141,9 @@ Database tables are created on startup. Formal schema migrations, full account m
 - [Demo walkthrough](docs/demo-walkthrough.md)
 - [Draft LinkedIn post](docs/linkedin-submission-draft.md)
 - [API contract](docs/api-contract.md)
+
+### Reproducible resource and security checks
+
+Run `backend/.venv/bin/python scripts/benchmark_planning.py` for deterministic CPU/peak-allocation measurements, and `backend/.venv/bin/python scripts/benchmark_workspace.py` for temporary SQLite workspace response measurements. Both use synthetic data without live AI. Results and methodology are in [the verification record](docs/verification.md). These measurements do not predict the challenge evaluator score.
+
+GitHub Actions runs Bandit and Python/frontend dependency audits as well as the test suites. Scans report known issues, not a guarantee of security. Revision and proposal snapshots are retained until their event is deleted; long-running deployments still need storage monitoring and an explicit retention policy.
