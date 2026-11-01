@@ -1,0 +1,17 @@
+services:
+  gatherly:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DATABASE_URL: sqlite:////data/gatherly.db
+      STATIC_DIR: /app/frontend/dist
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.1-flash-lite}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    volumes:
+      - gatherly-data:/data
+    restart: unless-stopped
+volumes:
+  gatherly-data:

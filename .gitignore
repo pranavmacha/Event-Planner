@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.db
+*.db-*
+data/
+node_modules/
+dist/
+playwright-report/
+test-results/
+.DS_Store
+*.log
+*.tsbuildinfo

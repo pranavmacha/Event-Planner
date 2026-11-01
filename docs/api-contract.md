@@ -1,0 +1,42 @@
+# Gatherly API contract
+
+All paths below are prefixed `/api`. JSON requests; cookie credentials; money is integer paise; dates ISO YYYY-MM-DD. IDs are opaque strings. Mutations return the full enriched Event unless noted. UI formats INR by dividing by 100. Errors return `{detail: string | validationErrors}`. Never store client-generated monetary totals.
+
+`GET /health` => `{status:"ok", ai_mode:"demo"|"live"}`
+`GET /events` => Event[] (may be full objects)
+`POST /events` accepts EventInput => Event. `POST /events/sample` => Event (optional sample explicitly selected by user).
+`GET /events/{id}` => Event. `DELETE /events/{id}` => 204; deletes that event, its proposals and revision history. All operations enforce cookie ownership.
+
+EventInput: `{name,occasion,city,event_date,budget_paise,guest_count,atmosphere,theme,priorities:string[],non_negotiables:string[],dietary_preferences:string,accessibility_needs:string,cultural_preferences:string}`. `guest_count` is an integer from 1 to 100,000; `budget_paise` is an integer from 100 to 100,000,000,000. Creation and proposed event dates must be today or later in Asia/Kolkata. Priorities use the category enum below; `catering`, `decoration` and `guest comfort` normalize to `food`, `decor` and `logistics`.
+Event: EventInput + `{id,version,concept,assumptions:string[],decisions:string[],risks:string[],ai_mode,budget_items:BudgetItem[],tasks:Task[],vendors:Vendor[],summary:Summary}`.
+Summary: `{projected_paise,reserve_paise,remaining_paise,overspend_paise,committed_paise,actual_paise,days_remaining,completed_tasks,total_tasks,category_totals:Record<string,number>}`. Projected excludes reserve; remaining = budget - projected - reserve; overspend = max(0,-remaining). Reserve = floor(budget / 10), in paise. Per-item forecast = committed ?? quoted ?? estimated, choosing the first non-null amount including zero. For a confirmed per-person quote or commitment with known coverage, exposure = max(0, guests − coverage) × estimate per guest; otherwise exposure is zero and unknown coverage is flagged. Item projected = max(actual paid to date, forecast + exposure). No stages are added together, and a deposit cannot reduce a larger unpaid commitment. Confirmed amounts are never guest-scaled. Projections and aggregate monetary totals exceeding JavaScript’s exact integer range (2^53 − 1) are rejected with 422; they are never clamped.
+
+BudgetItem: `{id,category,label,cost_type:"fixed"|"per_person",estimate_paise:number,quoted_paise:number|null,committed_paise:number|null,actual_paise:number|null,quote_guest_count:number|null,source:"estimate"|"user",notes:string,projected_paise:number,projection_basis:string}`. estimate_paise is per guest for per_person, otherwise total. category enum: food, venue, decor, photography, entertainment, logistics, other.
+`POST /events/{id}/budget` accepts budget input without id/projected/basis. `PATCH /events/{id}/budget/{item_id}` accepts partial budget input + optional expected_version. User additions and edits set `source` to `user`; initial allocations use `estimate`. All monetary inputs are non-negative integer paise, at most 100,000,000,000 per field. Quote guest coverage remains unknown unless explicitly supplied.
+
+Task: `{id,title,due_date,priority:"high"|"medium"|"low",status:"todo"|"in_progress"|"done",dependencies:string[],notes,readiness:"ready"|"blocked"|"at_risk"|"done",reasons:string[]}`.
+`POST /events/{id}/tasks` accepts Task input without id/readiness/reasons. `PATCH /events/{id}/tasks/{task_id}` accepts partial input + optional expected_version. Validate dependencies belong to event, reject cycles, reflect overdue predecessors.
+
+Vendor: `{id,name,category,quoted_paise,guests_covered:number|null,inclusions:string,exclusions:string,taxes_paise,additional_charges_paise,total_paise,payment_terms:string,availability:"unknown"|"available"|"unavailable",booking_status:"considering"|"contacted"|"booked",sample:boolean,notes:string}`.
+`total_paise` is a server-derived sum of quoted amount, taxes and additional charges. `POST /events/{id}/vendors` accepts Vendor input without id/total_paise. `PATCH /events/{id}/vendors/{vendor_id}` accepts partial input + optional expected_version.
+`POST /events/{id}/vendors/compare` `{vendor_ids:string[]}` => `{summary:string,tradeoffs:string[],questions:string[],ai_mode:string}`. Requires 2–6 distinct vendor IDs owned by this event. Does not alter the plan or select a quote automatically.
+
+`POST /events/{id}/proposals` `{message:string,request_id:string}` => Proposal or `{clarification:string,ai_mode}`. Supported schema fields only guest_count, budget_paise, event_date, priorities. Use explicit stated changes, preserve non-negotiables and user amounts. Preview generation never mutates Event. A successful proposal is idempotent per event and request_id; reusing that ID with a different message returns 409. request_id is 8–128 letters, digits, underscores or hyphens; messages are 3–4000 characters. Clarification responses create no proposal. Proposed concepts are refreshed from saved preferences to avoid old guest counts or dates; unfinished task deadlines shift by the event-date delta, while completed task dates stay unchanged.
+Proposal: `{id,base_version,status:"pending"|"applied"|"discarded",message,changes:{guest_count?,budget_paise?,event_date?,priorities?},before:Event,after:Event,category_impacts:{category,before_paise,after_paise,reason}[],task_impacts:{id,title,before_date,after_date,reason}[],tradeoffs:string[],warnings:string[],assumptions:string[],ai_mode}`.
+`POST /events/{id}/proposals/{proposal_id}/apply` => Event. Atomic version comparison; 409 stale. Retry already applied is idempotent.
+`POST /events/{id}/proposals/{proposal_id}/discard` => `{status:"discarded"}`. Event untouched. Repeating a discard is idempotent; an applied proposal cannot be discarded.
+`GET /events/{id}/revisions` => `{id,created_at,label,version,restored:boolean}[]` (newest first). `created_at` is an ISO timestamp with an explicit UTC offset, so browsers can display it in their local timezone.
+`POST /events/{id}/revisions/{revision_id}/restore` `{expected_version:number}` => Event. Stores the current snapshot, restores the entire prior snapshot atomically, and increments the current version. Financial records, task states and vendor records are all restored to that snapshot. History is retained, with the original plan, edit reasons and restore operations labeled. A mismatched expected_version returns 409.
+
+`DELETE /events/{id}/{collection}/{item_id}` accepts collection `budget`, `tasks` or `vendors`, plus optional `expected_version` query parameter, and returns Event. A task referenced by another task cannot be deleted until those dependencies are removed.
+
+Operational limits: 30 events per browser; 200 budget items, 200 tasks and 100 vendor options per event; 128 KiB maximum request body. AI endpoints share process-local rolling limits of 12 requests/browser/minute, 120/browser/hour and 30/source-IP/minute. Errors: 422 invalid input or planning constraint, 404 missing/unowned records, 409 version/state conflicts, 413 oversized requests, 429 rate limit and 503 AI/database unavailability. The anonymous cookie is HttpOnly and SameSite=Strict, with Secure controlled by COOKIE_SECURE.
+
+AI internal interface (backend/app/ai.py):
+- `get_mode() -> str`
+- `async generate_plan(event:dict) -> dict` with `{concept,task_suggestions:[{title,days_before,priority,notes}],assumptions:string[],decisions:string[],risks:string[]}`. Deterministic backend provides baseline tasks/costs; suggestions can augment safely.
+- `async extract_changes(message:str,event:dict) -> dict` returns `{changes:{...},clarification:str|null}`.
+- `async explain_revision(before:dict,after:dict,impacts:dict) -> dict` => `{tradeoffs:string[],warnings:string[],assumptions:string[]}`
+- `async compare_vendors(event:dict,vendors:list[dict]) -> dict` => `{summary,tradeoffs:string[],questions:string[],ai_mode}`
+- `AIError(Exception)` safe human-readable text; failure should yield 503 without mutating or silent live-to-demo fallback.
+All functions strictly validate output, demo deterministic, no execution tools or secrets in prompt. Backend validates extracted amounts/dates/priorities again.

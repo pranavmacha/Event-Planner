@@ -1,0 +1,14 @@
+# Gatherly demo walkthrough (approximately 4–5 minutes)
+
+Prepare a fresh browser profile and run Gatherly in demo mode. Keep this script visible beside the app. Sample quotations are illustrations, not contacted vendors.
+
+1. **Start with a celebration (30 seconds).** Open Gatherly. Create an event or choose the optional sample wedding: ₹8,00,000, 200 guests, four months from creation, food and guest comfort first, accessible venue required. Explain that the demo badge means no live model request is being made.
+2. **Make the plan yours (45 seconds).** Show the event concept, reserve, financial health, and next actionable tasks. In Budget, edit an illustrative estimate and save. Explain that quoted, committed and paid amounts are tracked separately; the projected cost does not add those stages together. In Timeline, complete a prerequisite and show the dependent task becoming ready.
+3. **Compare actual choices (45 seconds).** Add two user-entered catering options with guest coverage, inclusions/exclusions, taxes, extra charges and payment terms. Select both and compare. Point out coverage gaps and questions to ask. Availability stays “unknown” unless manually recorded; comparison does not book a vendor or alter the budget.
+4. **Introduce a realistic change (60 seconds).** Enter: “We now have 250 guests instead of 200, our budget is ₹7 lakh instead of ₹8 lakh, and the event is two weeks earlier. Keep food quality as the top priority.” Show the extracted numbers and date, before/after remaining budget, categories that changed, tasks brought forward, and unresolved constraints. Confirm that fixed costs and recorded quotes did not silently change.
+5. **Discard, then apply (45 seconds).** Discard the proposal; show the current guest count and budget unchanged. Generate the same request again, review it, then apply. Show updated event metrics. If over budget, point out that Gatherly reports the gap instead of inventing savings.
+6. **Prove persistence and recovery (30 seconds).** Refresh and show the revised state survived. Open History and restore the previous version. Explain the explicit confirmation and that the whole prior snapshot is restored, including expenses, tasks and vendor records.
+7. **Prove ownership (20 seconds).** Open the application in a fresh browser profile/private session. Its event list is empty. A copied API event URL from the first profile returns 404. Knowledge of an event ID is insufficient to read or change it.
+8. **Close (10 seconds).** Explain where Gemini adds value and where code makes the decisions. Mention that the repository includes unit/API tests, configuration, Docker deployment files and the submitted documentation. Use only actual links in the recording description.
+
+For recording, keep a sample clearly labeled. Do not imply vendor verification, live AI, deployment, or automated test success beyond what was actually demonstrated.
